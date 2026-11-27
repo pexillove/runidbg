@@ -2596,10 +2596,20 @@ where
             }
         }
         HleBuiltin::Arc4Random => {
-            let (_, _, vfs) = get_state(uc.get_data_mut());
+            let (tramp, _, vfs) = get_state(uc.get_data_mut());
             let mut b = [0u8; 4];
             vfs.fill_random(&mut b);
-            u32::from_le_bytes(b) as u64
+            let val = u32::from_le_bytes(b) as u64;
+            tramp.push_hle_event(crate::tracer::HleOpEvent {
+                kind: crate::tracer::ExtKind::HleSource,
+                subop_or_byte: 1, // arc4random
+                aux_subop: 0,
+                dst: 0,
+                src: val,
+                len: 4,
+                caller_pc,
+            });
+            val
         }
         HleBuiltin::Rand => {
             let (tramp, _, vfs) = get_state(uc.get_data_mut());
@@ -2610,7 +2620,17 @@ where
                     "rand()/random() 当前使用独立确定性 PRNG 桩实现（xorshift64，与 /dev/urandom 隔离，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
                 );
             }
-            vfs.next_libc_rand() as u64
+            let val = vfs.next_libc_rand() as u64;
+            tramp.push_hle_event(crate::tracer::HleOpEvent {
+                kind: crate::tracer::ExtKind::HleSource,
+                subop_or_byte: 0, // rand
+                aux_subop: 0,
+                dst: 0,
+                src: val,
+                len: 4,
+                caller_pc,
+            });
+            val
         }
         HleBuiltin::Srand => {
             let (tramp, _, vfs) = get_state(uc.get_data_mut());
@@ -2627,10 +2647,27 @@ where
         HleBuiltin::Arc4RandomBuf => {
             let len = (x1 as usize).min(1024 * 1024);
             let mut buf = vec![0u8; len];
-            {
-                let (_, _, vfs) = get_state(uc.get_data_mut());
+            let first8 = {
+                let (tramp, _, vfs) = get_state(uc.get_data_mut());
                 vfs.fill_random(&mut buf);
-            }
+                let mut f8 = [0u8; 8];
+                let n = buf.len().min(8);
+                f8[..n].copy_from_slice(&buf[..n]);
+                let f8_val = u64::from_le_bytes(f8);
+                if x0 != 0 && !buf.is_empty() {
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleSource,
+                        subop_or_byte: 4, // getrandom/arc4random_buf
+                        aux_subop: 0,
+                        dst: x0,
+                        src: f8_val,
+                        len: buf.len() as u64,
+                        caller_pc,
+                    });
+                }
+                f8_val
+            };
+            let _ = first8;
             if x0 != 0 && !buf.is_empty() {
                 let _ = uc.mem_write(x0, &buf);
             }
@@ -2650,8 +2687,18 @@ where
         }
         HleBuiltin::Time => {
             let sec = {
-                let (_, _, vfs) = get_state(uc.get_data_mut());
-                vfs.current_clock_ns() / 1_000_000_000
+                let (tramp, _, vfs) = get_state(uc.get_data_mut());
+                let s = vfs.current_clock_ns() / 1_000_000_000;
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleSource,
+                    subop_or_byte: 3, // time
+                    aux_subop: 0,
+                    dst: x0,
+                    src: s,
+                    len: if x0 != 0 { 8 } else { 0 },
+                    caller_pc,
+                });
+                s
             };
             if x0 != 0 {
                 let _ = uc.mem_write(x0, &(sec as i64).to_le_bytes());
@@ -2661,8 +2708,20 @@ where
         HleBuiltin::ClockGettime => {
             // int clock_gettime(clockid_t clk_id, struct timespec *tp)
             let ns = {
-                let (_, _, vfs) = get_state(uc.get_data_mut());
-                vfs.current_clock_ns()
+                let (tramp, _, vfs) = get_state(uc.get_data_mut());
+                let ns = vfs.current_clock_ns();
+                if x1 != 0 {
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleSource,
+                        subop_or_byte: 6, // clock_gettime
+                        aux_subop: 0,
+                        dst: x1,
+                        src: ns / 1_000_000_000,
+                        len: 16,
+                        caller_pc,
+                    });
+                }
+                ns
             };
             if x1 != 0 {
                 let sec = (ns / 1_000_000_000) as i64;
@@ -2677,8 +2736,20 @@ where
         HleBuiltin::Gettimeofday => {
             // int gettimeofday(struct timeval *tv, struct timezone *tz)
             let ns = {
-                let (_, _, vfs) = get_state(uc.get_data_mut());
-                vfs.current_clock_ns()
+                let (tramp, _, vfs) = get_state(uc.get_data_mut());
+                let ns = vfs.current_clock_ns();
+                if x0 != 0 {
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleSource,
+                        subop_or_byte: 5, // gettimeofday
+                        aux_subop: 0,
+                        dst: x0,
+                        src: ns / 1_000_000_000,
+                        len: 16,
+                        caller_pc,
+                    });
+                }
+                ns
             };
             if x0 != 0 {
                 let sec = (ns / 1_000_000_000) as i64;
@@ -2753,8 +2824,22 @@ where
                     let len = (x2 as usize).min(1024 * 1024);
                     let mut buf = vec![0u8; len];
                     {
-                        let (_, _, vfs) = get_state(uc.get_data_mut());
+                        let (tramp, _, vfs) = get_state(uc.get_data_mut());
                         vfs.fill_random(&mut buf);
+                        if x1 != 0 && !buf.is_empty() {
+                            let mut f8 = [0u8; 8];
+                            let n = buf.len().min(8);
+                            f8[..n].copy_from_slice(&buf[..n]);
+                            tramp.push_hle_event(crate::tracer::HleOpEvent {
+                                kind: crate::tracer::ExtKind::HleSource,
+                                subop_or_byte: 4, // getrandom
+                                aux_subop: 0,
+                                dst: x1,
+                                src: u64::from_le_bytes(f8),
+                                len: buf.len() as u64,
+                                caller_pc,
+                            });
+                        }
                     }
                     if x1 != 0 && !buf.is_empty() {
                         let _ = uc.mem_write(x1, &buf);
@@ -3717,7 +3802,17 @@ where
         }
         HleBuiltin::Lrand48 => {
             let (table, _, _) = get_state(uc.get_data_mut());
-            (table.next_lcg48() >> 17) & 0x7FFF_FFFF
+            let val = (table.next_lcg48() >> 17) & 0x7FFF_FFFF;
+            table.push_hle_event(crate::tracer::HleOpEvent {
+                kind: crate::tracer::ExtKind::HleSource,
+                subop_or_byte: 2, // lrand48
+                aux_subop: 0,
+                dst: 0,
+                src: val,
+                len: 4,
+                caller_pc,
+            });
+            val
         }
         HleBuiltin::Mrand48 => {
             let (table, _, _) = get_state(uc.get_data_mut());

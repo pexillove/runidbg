@@ -7,10 +7,10 @@
 `Rust + unidbg + ... = runidbg`
 
 <p>
-  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.4-FF6B2C?style=flat-square" alt="Release v0.4.4" /></a>
+  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.5-FF6B2C?style=flat-square" alt="Release v0.4.5" /></a>
   <img src="https://img.shields.io/badge/Rust-2021-E6522C?style=flat-square&logo=rust&logoColor=white" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/Target-Android%20ARM64-34D399?style=flat-square&logo=android&logoColor=white" alt="Android ARM64" />
-  <img src="https://img.shields.io/badge/Tests-126%2F126%20passing-10B981?style=flat-square" alt="Tests 126/126" />
+  <img src="https://img.shields.io/badge/Tests-135%2F135%20passing-10B981?style=flat-square" alt="Tests 135/135" />
   <img src="https://img.shields.io/badge/License-MIT-64748B?style=flat-square" alt="MIT License" />
 </p>
 
@@ -39,12 +39,12 @@
 - **纯 Rust 零 JVM 高性能** — `77 ms` 冷启动（`22.6×`）、`21.7 MB` 单实例内存（省 `82%`），单文件跨平台分发。
 - **四引擎 ARM64 后端** — `Unicorn 2.1`（全功能 Trace / Hook / GDB）与 `Dynarmic JIT` / `Linux KVM` / `macOS Hypervisor`（纯算最高 `480×`）统一接口切换。
 - **完整 Android 原生运行时** — ELF 动态链接、`110+` HLE、合并空闲链堆、JNI 1.6、APK 内存直载、`DeviceProfile` 真机画像、隔离双流 RNG 与离线护栏 Socket/epoll。
-- **零拷贝 Tracer、轻量污点与精简伪 C 反编译** — `17.03M insns/s` 双流 `.idx/.ext`（统一记录 HLE 事件）、纯 Rust 字节级前向/反向污点切片、**单路径符号提升 → 代数/ROTR/S-Box/OLLVM MBA 化简 → 自校验可编译伪 C & SMT-LIB2**、SIMD 内存扫描（`22.95 GB/s`）、全知查询与双跑差分。
+- **零拷贝 Tracer、轻量污点与精简伪 C 反编译** — `17.03M insns/s` 双流 `.idx/.ext`（统一记录 HLE 内存/熵源/时钟事件 + 缺失 `.ext` 显式告警）、纯 Rust 字节级前向/反向污点切片（支持 `--from-seq` / `--stop-at-pc` / `--stop-mem` 手术刀截断与熵源溯源标注）、**单路径符号提升 → 代数/ROTR/S-Box/OLLVM MBA/字节重装化简 + `--fold-rodata` + `UMULH`/`SMULH` 魔数除法反推 → 自校验可编译伪 C & SMT-LIB2**、SIMD 内存扫描（`22.95 GB/s`）、全知查询、内存重建（`mem`）与双跑差分污点联动（`diff --target-addr`）。
 - **内置 `good64` 零依赖 ARM64 汇编器与重定位器** — 覆盖 99% Android ARM64 指令（含位域、LSE 原子、系统寄存器、PAC/BTI、标量 FP、128-bit NEON & AES），内置 4B/16B/20B Inline Hook 跳板与多遍 PC 相对指令重定位器，无缝替代 Keystone。
-- **OLLVM / 字节码 VM 助手** — 自动识别 Dispatch Loop、4B/8B 跳转表、字节码 PC、Handler 分布与基址搬家差分，配合在线 `watchRegfile` 与指令字解码。
+- **OLLVM / 字节码 VM 助手** — 自动识别 Dispatch Loop、4B/8B 跳转表、字节码 PC、Handler 分布与基址搬家差分（支持 `--seq-range` 窗口聚焦），配合在线 `watchRegfile` 与指令字解码。
 - **`.rtape` 磁带与时间旅行** — 4KB 稀疏脏页增量与四引擎跨后端接力（Hyper/Dynarmic 极速初始化 → Unicorn 精录），支持 100% 比特级离线重放与 GDB 反向观察点。
 - **QuickJS 脚本与内置多核 RPC** — 零配置 Frida 风格 Hook 与 `runidbg.d.ts`；开箱即用 `tokio + axum` 无锁多核 Worker 池（`1,141 QPS`）、热重载、`/metrics` 与暗黑 Web UI。
-- **内置 MCP AI 逆向闭环** — 原生 stdio / Streamable HTTP 双模式 **38 个工具**（含 `emu_asm` 与 `trace_decompile`）、`EnvDiag` 缺环境自动诊断与轻量 DEX 索引，无缝接入 Claude / Cursor / Codex。
+- **内置 MCP AI 逆向闭环** — 原生 stdio / Streamable HTTP 双模式 **39 个工具**（含 `emu_asm`、`trace_decompile`、`trace_mem` 与 `trace_diff` 污点联动）、`EnvDiag` 缺环境自动诊断与轻量 DEX 索引，无缝接入 Claude / Cursor / Codex。
 
 ---
 
@@ -69,10 +69,11 @@ rpc.exports = {
 runidbg-cli run       sign.js                                      # 执行脚本
 runidbg-cli serve     sign.js --workers auto --allow-reload        # 启动多核 RPC 服务
 runidbg-cli asm       "paciasp; ubfx x0, x1, #4, #8; ret"          # 内置 good64 ARM64 汇编器
-runidbg-cli taint     trace.idx --mode backward --addr 0x50006470  # 离线污点 / diff / vm
-runidbg-cli decompile trace.idx --addr 0x50006470 --len 4 --smt2   # 动态污点切片 -> 自校验精简伪 C
-runidbg-cli ui        session.rtape --open                         # 暗黑 Web UI 时间旅行驾驶舱
-runidbg-cli mcp       --cwd .                                      # 启动 MCP 服务端（38 工具）
+runidbg-cli taint     trace.idx --mode backward --addr 0x50006470 --from-seq 1000  # 离线污点 / diff / vm
+runidbg-cli decompile trace.idx --addr 0x50006470 --len 8 --fold-rodata --smt2     # 切片 -> 自校验精简伪 C
+runidbg-cli mem       trace.idx --addr 0x50006170 --len 576 --at 1820000           # 任意时刻内存快照重建
+runidbg-cli ui        session.rtape --open                                         # 暗黑 Web UI 时间旅行驾驶舱
+runidbg-cli mcp       --cwd .                                                      # 启动 MCP 服务端（39 工具）
 ```
 
 ---
@@ -97,14 +98,14 @@ runidbg-cli mcp       --cwd .                                      # 启动 MCP 
 | 文档 | 内容 |
 | :--- | :--- |
 | [**完整使用指南**](./docs/GUIDE.md) | 多后端选型与签名、QuickJS API 字典、`good64` 汇编与 Inline Hook、Trace / 污点 / 切片伪 C / Diff / VM、`.rtape` 时间旅行与 GDB RSP |
-| [**AI Agent Skill**](./docs/SKILL.md) | 面向 Claude / Cursor / Codex 的 38 个 MCP 工具参考与自动化逆向工作流 |
+| [**AI Agent Skill**](./docs/SKILL.md) | 面向 Claude / Cursor / Codex 的 39 个 MCP 工具参考与自动化逆向工作流 |
 | [**GitHub Releases**](https://github.com/tiwe0/runidbg/releases) | 全平台预编译二进制与 `SHA256SUMS.txt` |
 
 ---
 
 ## Contributing & Acknowledgements
 
-欢迎通过 Issue / PR 提交脱敏后的不兼容 Android ARM64 `.so` 样本与最小复现脚本；本地校验请运行 `cargo test`（macOS ARM64 共 126 项测试，Linux/Windows 共 125 项）。
+欢迎通过 Issue / PR 提交脱敏后的不兼容 Android ARM64 `.so` 样本与最小复现脚本；本地校验请运行 `cargo test`（macOS ARM64 共 135 项测试，Linux/Windows 共 134 项）。
 
 特别致谢 [**unidbg**](https://github.com/zhkl0228/unidbg) 及其作者 `zhkl0228`——在没有 AI 辅助的年代凭一己之力手写并持续维护横跨 Android 与 iOS 的仿真框架令人由衷钦佩；同时感谢 [Unicorn Engine](https://github.com/unicorn-engine/unicorn)、[Dynarmic](https://github.com/merryhime/dynarmic)、[QuickJS](https://bellard.org/quickjs/) / `rquickjs`、`goblin`、`bad64` 等优秀开源项目。
 

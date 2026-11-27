@@ -29,6 +29,9 @@ pub enum ExtKind {
     HleFree = 7,
     /// 紧随 `HleMemcpy` 的配套长度记录：`addr=dst`, `value=len`, `pc=caller_pc`
     HleMeta = 8,
+    /// 外部熵源/时钟源 HLE 事件（`rand`/`arc4random`/`lrand48`/`time`/`getrandom`/`gettimeofday`/`clock_gettime`）：
+    /// `size_or_reg=subop`, `_pad[0]=len_u8`, `addr=dst_buf_or_0`, `value=ret_val_or_sec`, `pc=caller_pc`
+    HleSource = 9,
 }
 
 impl ExtKind {
@@ -42,6 +45,7 @@ impl ExtKind {
             6 => Some(Self::HleMalloc),
             7 => Some(Self::HleFree),
             8 => Some(Self::HleMeta),
+            9 => Some(Self::HleSource),
             _ => None,
         }
     }
@@ -91,6 +95,14 @@ impl HleTraceEvent {
             "free" => format!(
                 "    [HLE free] ptr=0x{:016x} caller=0x{:016x}",
                 self.dst, self.pc
+            ),
+            "rand" | "random" | "arc4random" | "lrand48" | "time" => format!(
+                "    [HLE {}()] ret=0x{:x} caller=0x{:016x}",
+                self.op, self.src, self.pc
+            ),
+            "getrandom" | "gettimeofday" | "clock_gettime" => format!(
+                "    [HLE {}()] dst=0x{:016x} len={} val=0x{:x} caller=0x{:016x}",
+                self.op, self.dst, self.len, self.src, self.pc
             ),
             other => format!(
                 "    [HLE {}] dst=0x{:016x} src=0x{:016x} len={} caller=0x{:016x}",
@@ -292,6 +304,26 @@ pub fn format_ext_record(ext: &ExtRecord) -> String {
         }
         Some(ExtKind::HleMeta) => {
             format!("    [HLE len] dst=0x{addr:016x} len={value}")
+        }
+        Some(ExtKind::HleSource) => {
+            let tag = match ext.size_or_reg {
+                0 => "rand",
+                1 => "arc4random",
+                2 => "lrand48",
+                3 => "time",
+                4 => "getrandom",
+                5 => "gettimeofday",
+                6 => "clock_gettime",
+                _ => "source",
+            };
+            if addr != 0 {
+                format!(
+                    "    [HLE {tag}] dst=0x{addr:016x} len={} val=0x{value:016x}",
+                    ext._pad[0]
+                )
+            } else {
+                format!("    [HLE {tag}] ret=0x{value:016x}")
+            }
         }
         None => format!("    [EXT?] kind={} val=0x{value:016x}", ext.kind),
     }

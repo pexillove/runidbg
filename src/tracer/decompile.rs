@@ -18,7 +18,8 @@ use bad64::{Imm, Instruction, Operand, Reg, Shift};
 use crate::tracer::reader::TraceReader;
 use crate::tracer::record::{ExtKind, ExtRecord, HleTraceEvent};
 use crate::tracer::taint::{
-    format_reg_slot, parse_reg_slot, TaintOptions, TaintSeed, TaintStep,
+    format_reg_slot, is_hle_entropy_or_time_mem, is_hle_entropy_or_time_reg, parse_reg_slot,
+    TaintOptions, TaintSeed, TaintStep,
 };
 
 // ============================================================================
@@ -30,6 +31,14 @@ use crate::tracer::taint::{
 pub struct DecompileOptions {
     /// 观测点指令下标（默认最后一条指令）
     pub anchor_idx: Option<usize>,
+    /// 切片起点下界（含该指令；等价 CLI `--from-seq`），可将任意单轮循环/子阶段边界提升为符号输入
+    pub from_idx: Option<usize>,
+    /// 命中这些 PC 时停止反向回溯（把该边界处的寄存器/内存直接提升为符号输入参数）
+    pub stop_at_pcs: Vec<u64>,
+    /// 命中读取这些内存区间 `(addr, len)` 时直接钉死为符号输入参数，不再追寻更早写入
+    pub stop_mem_ranges: Vec<(u64, usize)>,
+    /// 将整个 Trace 中从未被写入过的只读内存（如 `.rodata` / VM 字节码）直接折叠为常量（默认 false）
+    pub fold_rodata: bool,
     /// 最大反向扫描指令数（0 表示不限）
     pub max_insns: usize,
     /// 最大切片步数（默认 4096）
@@ -40,7 +49,7 @@ pub struct DecompileOptions {
     pub track_sp: bool,
     /// 生成的 C 函数名称（默认 `"decompiled_slice"`）
     pub function_name: String,
-    /// 是否执行代数/旋转/MBA 化简（默认 true）
+    /// 是否执行代数/旋转/MBA/字节重装化简（默认 true）
     pub simplify: bool,
     /// 是否额外导出标准 `QF_BV` SMT-LIB2 文本（默认 false）
     pub emit_smt2: bool,
@@ -52,6 +61,10 @@ impl Default for DecompileOptions {
     fn default() -> Self {
         Self {
             anchor_idx: None,
+            from_idx: None,
+            stop_at_pcs: Vec::new(),
+            stop_mem_ranges: Vec::new(),
+            fold_rodata: false,
             max_insns: 0,
             max_steps: 4096,
             track_mem_index: true,
@@ -90,12 +103,14 @@ pub struct DecompiledTable {
 pub struct DecompileReport {
     pub seed_desc: String,
     pub anchor_idx: usize,
+    pub stop_idx: usize,
     pub scanned_insns: usize,
     pub slice_insns: usize,
     pub raw_nodes: usize,
     pub simplified_nodes: usize,
     pub inputs: Vec<DecompiledInput>,
     pub tables: Vec<DecompiledTable>,
+    pub origin_annotations: Vec<String>,
     pub expected_output: Option<u64>,
     pub evaluated_output: Option<u64>,
     /// `Some(true)` = 化简后表达式在 Trace 真实输入上与真实输出逐 bit 一致
@@ -111,17 +126,25 @@ impl DecompileReport {
         let verify_str = match self.verified {
             Some(true) => "PASS (bit-exact)",
             Some(false) => "MISMATCH",
-            None => "UNCHECKED (部分符号输入未在 Trace 中观测到具体初始值)",
+            None => "UNCHECKED (部分符号输入未在 Trace 中观测到具体初始值或含 Opaque 指令)",
         };
         out.push_str(&format!(
-            "/* runidbg dynamic slice decompiler | seed={} | anchor=#{} | slice_insns={} | dag={} -> {} nodes | verify={} */\n",
+            "/* runidbg dynamic slice decompiler | seed={} | range=#{}..#{} | slice_insns={} | dag={} -> {} nodes | verify={} */\n",
             self.seed_desc,
+            self.stop_idx,
             self.anchor_idx,
             self.slice_insns,
             self.raw_nodes,
             self.simplified_nodes,
             verify_str
         ));
+        if !self.origin_annotations.is_empty() {
+            out.push_str("/* External entropy/time origins:\n");
+            for note in &self.origin_annotations {
+                out.push_str(&format!(" *   {note}\n"));
+            }
+            out.push_str(" */\n");
+        }
         out.push_str(&self.c_code);
         if let Some(ref smt) = self.smt2 {
             out.push_str("\n/* --- SMT-LIB2 (QF_BV) ---\n");
@@ -176,6 +199,8 @@ enum BvBinOp {
     Add,
     Sub,
     Mul,
+    UMulh,
+    SMulh,
     UDiv,
     SDiv,
     And,
@@ -189,7 +214,10 @@ enum BvBinOp {
 
 impl BvBinOp {
     fn is_commutative(self) -> bool {
-        matches!(self, Self::Add | Self::Mul | Self::And | Self::Or | Self::Xor)
+        matches!(
+            self,
+            Self::Add | Self::Mul | Self::UMulh | Self::SMulh | Self::And | Self::Or | Self::Xor
+        )
     }
 }
 
@@ -400,6 +428,18 @@ impl BvArena {
         if lsb == 0 && width < xw {
             return self.unop(BvUnOp::Trunc, x, width);
         }
+        // Extract(ZExt(x), lsb, w) 当切片完全落在原始窄宽度内 -> 直接穿透 ZExt
+        if let BvNode::UnOp {
+            op: BvUnOp::ZExt,
+            x: inner,
+            ..
+        } = self.get(x).clone()
+        {
+            let iw = self.width(inner);
+            if u16::from(lsb) + u16::from(width) <= u16::from(iw) {
+                return self.extract(inner, lsb, width);
+            }
+        }
         self.intern_node(BvNode::Extract { x, lsb, width })
     }
 
@@ -410,6 +450,14 @@ impl BvArena {
             return self.c(res, width);
         }
         match (op, self.get(x).clone()) {
+            (BvUnOp::Trunc, BvNode::BinOp { op: BvBinOp::Lshr, a: base, b: sh_id, .. }) => {
+                if let Some(sh) = self.as_const(sh_id) {
+                    let bw = self.width(base);
+                    if sh <= 64 && (sh as u16) + u16::from(width) <= u16::from(bw) {
+                        return self.extract(base, sh as u8, width);
+                    }
+                }
+            }
             (BvUnOp::Not, BvNode::UnOp { op: BvUnOp::Not, x: inner, .. })
             | (BvUnOp::Neg, BvNode::UnOp { op: BvUnOp::Neg, x: inner, .. })
             | (BvUnOp::Bswap, BvNode::UnOp { op: BvUnOp::Bswap, x: inner, .. })
@@ -474,9 +522,25 @@ impl BvArena {
             (BvBinOp::Add | BvBinOp::Sub | BvBinOp::Or | BvBinOp::Xor | BvBinOp::Shl | BvBinOp::Lshr | BvBinOp::Ashr | BvBinOp::Ror, Some(0)) => {
                 return a;
             }
-            (BvBinOp::And | BvBinOp::Mul, Some(0)) => return self.c(0, width),
+            (BvBinOp::And | BvBinOp::Mul | BvBinOp::UMulh | BvBinOp::SMulh, Some(0)) => {
+                return self.c(0, width)
+            }
             (BvBinOp::Mul | BvBinOp::UDiv | BvBinOp::SDiv, Some(1)) => return a,
             (BvBinOp::And, Some(v)) if v == all_ones => return a,
+            (BvBinOp::And, Some(v)) => {
+                // 消除对窄 ZExt 节点的冗余高位掩码（例如 `((uint64_t)(uint8_t)x) & 0xff` -> `(uint64_t)(uint8_t)x`）
+                if let BvNode::UnOp {
+                    op: BvUnOp::ZExt,
+                    x: inner,
+                    ..
+                } = self.get(a)
+                {
+                    let imask = width_mask(self.width(*inner));
+                    if (v & imask) == imask {
+                        return a;
+                    }
+                }
+            }
             (BvBinOp::Or, Some(v)) if v == all_ones => return self.c(all_ones, width),
             _ => {}
         }
@@ -887,6 +951,13 @@ impl BvArena {
                 }
             }
             BvBinOp::Or => {
+                // 0. 字节重装恒等式（消除 VM/按字节拆装噪声）：
+                //    (uint64_t)(uint8_t)x | ((uint64_t)(uint8_t)(x>>8) << 8) | ... -> x（反序 -> BSWAP(x)）
+                if matches!(width, 16 | 32 | 64) {
+                    if let Some(collapsed) = self.try_collapse_byte_reassembly(id, width) {
+                        return collapsed;
+                    }
+                }
                 // 分配吸收：(a & b) | (a & ~b) -> a
                 if let (
                     BvNode::BinOp { op: BvBinOp::And, a: x1, b: y1, .. },
@@ -911,6 +982,158 @@ impl BvArena {
         }
 
         id
+    }
+
+    /// 扁平化 `Or` 树并识别「把同一标量按字节拆开再左移拼回」的字节重装模式（顺序 -> `base`，逆序 -> `Bswap(base)`）
+    fn try_collapse_byte_reassembly(&mut self, root_or: NodeId, width: u8) -> Option<NodeId> {
+        let num_bytes = (width / 8) as usize;
+        let mut terms = Vec::with_capacity(num_bytes);
+        let mut stack = vec![root_or];
+        while let Some(cur) = stack.pop() {
+            if let BvNode::BinOp {
+                op: BvBinOp::Or,
+                a,
+                b,
+                width: w,
+            } = self.get(cur)
+            {
+                if *w == width {
+                    stack.push(*b);
+                    stack.push(*a);
+                    continue;
+                }
+            }
+            terms.push(cur);
+            if terms.len() > num_bytes {
+                return None;
+            }
+        }
+        if terms.len() != num_bytes {
+            return None;
+        }
+
+        // 解析每一项提取出的 `(base, src_byte_lane, dst_byte_lane)`
+        let mut base_id: Option<NodeId> = None;
+        let mut lane_map: Vec<Option<usize>> = vec![None; num_bytes];
+        for term in terms {
+            let (base, src_lane, dst_lane) = self.match_byte_lane_term(term, width)?;
+            if src_lane >= num_bytes || dst_lane >= num_bytes || lane_map[dst_lane].is_some() {
+                return None;
+            }
+            match base_id {
+                None => base_id = Some(base),
+                Some(b) if b != base => return None,
+                Some(_) => {}
+            }
+            lane_map[dst_lane] = Some(src_lane);
+        }
+        let base = base_id?;
+        if self.width(base) < width {
+            return None;
+        }
+        let is_identity = (0..num_bytes).all(|i| lane_map[i] == Some(i));
+        if is_identity {
+            return Some(self.adapt_width(base, width, false));
+        }
+        let is_reverse = (0..num_bytes).all(|i| lane_map[i] == Some(num_bytes - 1 - i));
+        if is_reverse {
+            let adapted = self.adapt_width(base, width, false);
+            return Some(self.unop(BvUnOp::Bswap, adapted, width));
+        }
+        None
+    }
+
+    /// 匹配单个字节重装项，返回 `(base, src_byte_lane, dst_byte_lane)`
+    fn match_byte_lane_term(&self, id: NodeId, width: u8) -> Option<(NodeId, usize, usize)> {
+        // 情况 A：`base & (0xff << (8*k))`（原位掩码，k >= 1；k == 0 即 `& 0xff` 留给情况 B 以便解开 `(x >> 24) & 0xff` 这类 BSWAP）
+        if let BvNode::BinOp {
+            op: BvBinOp::And,
+            a,
+            b,
+            ..
+        } = self.get(id)
+        {
+            if let Some(mask) = self.as_const(*b) {
+                for k in 1..(usize::from(width) / 8) {
+                    if mask == (0xFFu64 << (k * 8)) {
+                        return Some((*a, k, k));
+                    }
+                }
+            }
+        }
+        // 情况 B：`Shl(inner, 8*dst_lane)` 或直接 `dst_lane = 0` 的 `inner`
+        let (inner, dst_lane) = match self.get(id) {
+            BvNode::BinOp {
+                op: BvBinOp::Shl,
+                a,
+                b,
+                ..
+            } => {
+                let sh = self.as_const(*b)?;
+                if !sh.is_multiple_of(8) || sh >= u64::from(width) {
+                    return None;
+                }
+                (*a, (sh / 8) as usize)
+            }
+            _ => (id, 0usize),
+        };
+        let (base, src_lane) = self.extract_byte_lane_source(inner)?;
+        Some((base, src_lane, dst_lane))
+    }
+
+    fn extract_byte_lane_source(&self, id: NodeId) -> Option<(NodeId, usize)> {
+        match self.get(id) {
+            BvNode::UnOp {
+                op: BvUnOp::ZExt,
+                x,
+                ..
+            } => self.extract_byte_lane_source(*x),
+            BvNode::Extract {
+                x,
+                lsb,
+                width: 8,
+            } if lsb.is_multiple_of(8) => Some((*x, (*lsb / 8) as usize)),
+            BvNode::UnOp {
+                op: BvUnOp::Trunc,
+                x,
+                width: 8,
+            } => {
+                if let BvNode::BinOp {
+                    op: BvBinOp::Lshr,
+                    a,
+                    b,
+                    ..
+                } = self.get(*x)
+                {
+                    let sh = self.as_const(*b)?;
+                    if sh.is_multiple_of(8) {
+                        return Some((*a, (sh / 8) as usize));
+                    }
+                }
+                Some((*x, 0))
+            }
+            BvNode::BinOp {
+                op: BvBinOp::And,
+                a,
+                b,
+                ..
+            } if self.as_const(*b) == Some(0xFF) => {
+                if let BvNode::BinOp {
+                    op: BvBinOp::Lshr,
+                    a: base,
+                    b: sh_id,
+                    ..
+                } = self.get(*a)
+                {
+                    let sh = self.as_const(*sh_id)?;
+                    if sh.is_multiple_of(8) {
+                        return Some((*base, (sh / 8) as usize));
+                    }
+                }
+                Some((*a, 0))
+            }
+            _ => None,
+        }
     }
 
     fn match_rotate(&self, rshift: &BvNode, lshift: &BvNode, width: u8) -> Option<(NodeId, u64)> {
@@ -1056,6 +1279,12 @@ fn eval_binop(op: BvBinOp, a: u64, b: u64, width: u8) -> Option<u64> {
         BvBinOp::Add => a.wrapping_add(b) & m,
         BvBinOp::Sub => a.wrapping_sub(b) & m,
         BvBinOp::Mul => a.wrapping_mul(b) & m,
+        BvBinOp::UMulh => ((u128::from(a) * u128::from(b)) >> 64) as u64 & m,
+        BvBinOp::SMulh => {
+            let sa = i128::from(a as i64);
+            let sb = i128::from(b as i64);
+            ((sa * sb) >> 64) as u64 & m
+        }
         BvBinOp::UDiv => a.checked_div(b).unwrap_or(0) & m,
         BvBinOp::SDiv => {
             if width == 32 {
@@ -1123,7 +1352,13 @@ struct SliceLifter<'a> {
     origin_regs: HashSet<u8>,
     /// 切片起始点处受污点的输入内存地址集合
     origin_mem_addrs: HashSet<u64>,
+    /// 整个 Trace 中曾被写入过的内存字节集合（用于 `--fold-rodata` 区分只读 `.rodata`/字节码 与可写缓冲）
+    ever_written_mem: HashSet<u64>,
+    /// 用户显式钉死为符号输入的内存区间（优先级高于 `fold_rodata`）
+    stop_mem_ranges: Vec<(u64, usize)>,
+    fold_rodata: bool,
     track_sp: bool,
+    entropy_counter: usize,
 }
 
 impl<'a> SliceLifter<'a> {
@@ -1131,6 +1366,8 @@ impl<'a> SliceLifter<'a> {
         reader: &'a TraceReader,
         origin_regs: HashSet<u8>,
         origin_mem_addrs: HashSet<u64>,
+        stop_mem_ranges: Vec<(u64, usize)>,
+        fold_rodata: bool,
         initial_regs: &HashMap<u8, u64>,
         track_sp: bool,
     ) -> Self {
@@ -1148,8 +1385,36 @@ impl<'a> SliceLifter<'a> {
             sym_mem: HashMap::new(),
             origin_regs,
             origin_mem_addrs,
+            ever_written_mem: HashSet::new(),
+            stop_mem_ranges,
+            fold_rodata,
             track_sp,
+            entropy_counter: 0,
         }
+    }
+
+    fn is_stop_mem(&self, addr: u64) -> bool {
+        self.stop_mem_ranges
+            .iter()
+            .any(|&(s, l)| addr >= s && addr < s.saturating_add(l as u64))
+    }
+
+    fn alloc_entropy_sym(&mut self, op: &str, width: u8, sample: Option<u64>) -> NodeId {
+        let idx = self.entropy_counter;
+        self.entropy_counter += 1;
+        let prefix = match op {
+            "rand" | "random" | "lrand48" | "arc4random" | "getrandom" => "rand",
+            "gettimeofday" | "clock_gettime" | "time" => "time",
+            _ => "ext",
+        };
+        // 使用 64..255 的虚拟槽位避免与物理 X0..V31 冲突
+        let pseudo_slot = (64 + (idx % 190)) as u8;
+        self.arena.intern_node(BvNode::SymReg {
+            reg_slot: pseudo_slot,
+            name: format!("{prefix}_{idx}"),
+            width,
+            sample: sample.map(|v| v & width_mask(width)),
+        })
     }
 
     fn update_concrete_from_step(&mut self, idx: usize) {
@@ -1327,12 +1592,39 @@ impl<'a> SliceLifter<'a> {
     }
 
     fn load_sym_bytes(&mut self, addr: u64, byte_len: usize, sample_val: Option<u64>) -> NodeId {
+        self.load_sym_bytes_ex(addr, byte_len, sample_val, true)
+    }
+
+    fn load_sym_bytes_ex(
+        &mut self,
+        addr: u64,
+        byte_len: usize,
+        sample_val: Option<u64>,
+        honor_stop_mem: bool,
+    ) -> NodeId {
         let mut bytes = Vec::with_capacity(byte_len);
         for i in 0..byte_len {
             let a = addr.wrapping_add(i as u64);
             let sb = sample_val.map(|v| ((v >> (i * 8)) & 0xFF) as u8);
-            if let Some(&existing) = self.sym_mem.get(&a) {
+            if honor_stop_mem && self.is_stop_mem(a) {
+                // --stop-mem 钉死的内存边界优先于窗口内历史写入/HLE 填充，直接作为符号输入
+                let node = self.arena.sym_mem_byte(a, sb);
+                self.sym_mem.insert(a, node);
+                bytes.push(node);
+            } else if let Some(&existing) = self.sym_mem.get(&a) {
                 bytes.push(existing);
+            } else if self.fold_rodata
+                && !self.ever_written_mem.contains(&a)
+                && !self.is_stop_mem(a)
+            {
+                if let Some(bval) = sb {
+                    // --fold-rodata：Trace 中从未被写入过的只读内存（.rodata / VM 字节码）直接折叠为常量！
+                    bytes.push(self.arena.c(u64::from(bval), 8));
+                } else {
+                    let node = self.arena.sym_mem_byte(a, None);
+                    self.sym_mem.insert(a, node);
+                    bytes.push(node);
+                }
             } else if self.origin_mem_addrs.contains(&a) {
                 let node = self.arena.sym_mem_byte(a, sb);
                 self.sym_mem.insert(a, node);
@@ -1348,7 +1640,11 @@ impl<'a> SliceLifter<'a> {
         self.arena.concat_le_bytes(&bytes)
     }
 
-    fn apply_hle_events(&mut self, events: &[HleTraceEvent]) {
+    fn apply_hle_events(
+        &mut self,
+        events: &[HleTraceEvent],
+        last_mem_write_bytes: &HashMap<u64, u8>,
+    ) {
         for ev in events {
             match ev.op {
                 "memcpy" | "memmove" | "realloc_copy" => {
@@ -1356,11 +1652,19 @@ impl<'a> SliceLifter<'a> {
                     let snapshot: Vec<(u64, Option<NodeId>)> = (0..len)
                         .map(|i| {
                             let s = ev.src.wrapping_add(i);
-                            let sym = self.sym_mem.get(&s).copied().or_else(|| {
-                                self.origin_mem_addrs
-                                    .contains(&s)
-                                    .then(|| self.arena.sym_mem_byte(s, None))
-                            });
+                            let sym = if self.is_stop_mem(s) {
+                                Some(
+                                    self.arena
+                                        .sym_mem_byte(s, last_mem_write_bytes.get(&s).copied()),
+                                )
+                            } else {
+                                self.sym_mem.get(&s).copied().or_else(|| {
+                                    self.origin_mem_addrs.contains(&s).then(|| {
+                                        self.arena
+                                            .sym_mem_byte(s, last_mem_write_bytes.get(&s).copied())
+                                    })
+                                })
+                            };
                             (ev.dst.wrapping_add(i), sym)
                         })
                         .collect();
@@ -1674,6 +1978,8 @@ impl<'a> SliceLifter<'a> {
                     Some(prod)
                 }
             }
+            "umulh" => self.lift_bin(ops, BvBinOp::UMulh, 64),
+            "smulh" => self.lift_bin(ops, BvBinOp::SMulh, 64),
             "udiv" => self.lift_bin(ops, BvBinOp::UDiv, dst_w),
             "sdiv" => self.lift_bin(ops, BvBinOp::SDiv, dst_w),
             "and" | "ands" => self.lift_bin(ops, BvBinOp::And, dst_w),
@@ -1790,9 +2096,103 @@ impl<'a> SliceLifter<'a> {
                 let extracted = self.arena.binop(BvBinOp::And, shifted, c_wmask, dst_w);
                 Some(self.arena.binop(BvBinOp::Or, cleared, extracted, dst_w))
             }
+            "ubfiz" | "sbfiz" => {
+                let rn = ops.get(1).and_then(|o| self.operand_expr(o, dst_w))?;
+                let lsb = ops.get(2).and_then(Self::operand_imm_u64)? as u8;
+                let w = ops.get(3).and_then(Self::operand_imm_u64)? as u8;
+                if w == 0 || u16::from(lsb) + u16::from(w) > u16::from(dst_w) {
+                    return None;
+                }
+                if mnem == "ubfiz" {
+                    let mask = self.arena.c(width_mask(w), dst_w);
+                    let masked = self.arena.binop(BvBinOp::And, rn, mask, dst_w);
+                    let c_lsb = self.arena.c(u64::from(lsb), dst_w);
+                    Some(self.arena.binop(BvBinOp::Shl, masked, c_lsb, dst_w))
+                } else {
+                    let up_amt = dst_w - w;
+                    let c_up = self.arena.c(u64::from(up_amt), dst_w);
+                    let up = self.arena.binop(BvBinOp::Shl, rn, c_up, dst_w);
+                    let dn_amt = dst_w - (lsb + w);
+                    let c_dn = self.arena.c(u64::from(dn_amt), dst_w);
+                    let dn = self.arena.binop(BvBinOp::Ashr, up, c_dn, dst_w);
+                    let c_clear = self.arena.c((!width_mask(lsb)) & width_mask(dst_w), dst_w);
+                    Some(self.arena.binop(BvBinOp::And, dn, c_clear, dst_w))
+                }
+            }
+            "ubfm" | "sbfm" => {
+                let rn = ops.get(1).and_then(|o| self.operand_expr(o, dst_w))?;
+                let immr = ops.get(2).and_then(Self::operand_imm_u64)? as u8;
+                let imms = ops.get(3).and_then(Self::operand_imm_u64)? as u8;
+                if immr >= dst_w || imms >= dst_w {
+                    return None;
+                }
+                if imms >= immr {
+                    // 等价 ubfx / sbfx(lsb=immr, width=imms-immr+1)
+                    let lsb = immr;
+                    let w = imms - immr + 1;
+                    if mnem == "ubfm" {
+                        let c_lsb = self.arena.c(u64::from(lsb), dst_w);
+                        let sh = self.arena.binop(BvBinOp::Lshr, rn, c_lsb, dst_w);
+                        let mask = self.arena.c(width_mask(w), dst_w);
+                        Some(self.arena.binop(BvBinOp::And, sh, mask, dst_w))
+                    } else {
+                        let c_up = self.arena.c(u64::from(dst_w - (lsb + w)), dst_w);
+                        let up = self.arena.binop(BvBinOp::Shl, rn, c_up, dst_w);
+                        let c_dn = self.arena.c(u64::from(dst_w - w), dst_w);
+                        Some(self.arena.binop(BvBinOp::Ashr, up, c_dn, dst_w))
+                    }
+                } else {
+                    // 等价 ubfiz / sbfiz(lsb=dst_w-immr, width=imms+1)
+                    let lsb = dst_w - immr;
+                    let w = imms + 1;
+                    if u16::from(lsb) + u16::from(w) > u16::from(dst_w) {
+                        return None;
+                    }
+                    if mnem == "ubfm" {
+                        let mask = self.arena.c(width_mask(w), dst_w);
+                        let masked = self.arena.binop(BvBinOp::And, rn, mask, dst_w);
+                        let c_lsb = self.arena.c(u64::from(lsb), dst_w);
+                        Some(self.arena.binop(BvBinOp::Shl, masked, c_lsb, dst_w))
+                    } else {
+                        let c_up = self.arena.c(u64::from(dst_w - w), dst_w);
+                        let up = self.arena.binop(BvBinOp::Shl, rn, c_up, dst_w);
+                        let c_dn = self.arena.c(u64::from(dst_w - (lsb + w)), dst_w);
+                        let dn = self.arena.binop(BvBinOp::Ashr, up, c_dn, dst_w);
+                        let c_clear = self.arena.c((!width_mask(lsb)) & width_mask(dst_w), dst_w);
+                        Some(self.arena.binop(BvBinOp::And, dn, c_clear, dst_w))
+                    }
+                }
+            }
+            "bfc" => {
+                let dst = self.reg_expr(rd, dst_w);
+                let lsb = ops.get(1).and_then(Self::operand_imm_u64)? as u8;
+                let w = ops.get(2).and_then(Self::operand_imm_u64)? as u8;
+                if w == 0 || u16::from(lsb) + u16::from(w) > u16::from(dst_w) {
+                    return None;
+                }
+                let field_mask = width_mask(w).wrapping_shl(u32::from(lsb)) & width_mask(dst_w);
+                let c_clear = self.arena.c((!field_mask) & width_mask(dst_w), dst_w);
+                Some(self.arena.binop(BvBinOp::And, dst, c_clear, dst_w))
+            }
             "rev" => {
                 let src = ops.get(1).and_then(|o| self.operand_expr(o, dst_w))?;
                 Some(self.arena.unop(BvUnOp::Bswap, src, dst_w))
+            }
+            "rev16" => {
+                let src = ops.get(1).and_then(|o| self.operand_expr(o, dst_w))?;
+                let (m_lo, m_hi) = if dst_w == 32 {
+                    (0x00FF_00FFu64, 0xFF00_FF00u64)
+                } else {
+                    (0x00FF_00FF_00FF_00FFu64, 0xFF00_FF00_FF00_FF00u64)
+                };
+                let c_lo = self.arena.c(m_lo, dst_w);
+                let c_hi = self.arena.c(m_hi, dst_w);
+                let c8 = self.arena.c(8, dst_w);
+                let lo = self.arena.binop(BvBinOp::And, src, c_lo, dst_w);
+                let hi = self.arena.binop(BvBinOp::And, src, c_hi, dst_w);
+                let lo_sh = self.arena.binop(BvBinOp::Shl, lo, c8, dst_w);
+                let hi_sh = self.arena.binop(BvBinOp::Lshr, hi, c8, dst_w);
+                Some(self.arena.binop(BvBinOp::Or, lo_sh, hi_sh, dst_w))
             }
             "rev32" => {
                 let src = ops.get(1).and_then(|o| self.operand_expr(o, 64))?;
@@ -1963,6 +2363,7 @@ struct CCodeEmitter<'a> {
     used_tables: BTreeSet<usize>,
     need_rotr32: bool,
     need_rotr64: bool,
+    need_bswap16: bool,
     need_bswap32: bool,
     need_bswap64: bool,
     need_rbit32: bool,
@@ -1975,6 +2376,9 @@ struct CCodeEmitter<'a> {
     need_udiv64: bool,
     need_sdiv32: bool,
     need_sdiv64: bool,
+    need_umulh64: bool,
+    need_smulh64: bool,
+    suppress_mulh_hint: bool,
     cse_names: HashMap<NodeId, String>,
     stmts: Vec<String>,
 }
@@ -1993,7 +2397,7 @@ impl<'a> CCodeEmitter<'a> {
         arena.visit_reachable(root, &mut reachable);
 
         let mut raw_mem_addrs: BTreeMap<u64, Option<u8>> = BTreeMap::new();
-        let mut reg_map: BTreeMap<u8, (String, u8, Option<u64>)> = BTreeMap::new();
+        let mut reg_map: BTreeMap<(u8, String), (String, u8, Option<u64>)> = BTreeMap::new();
         let mut used_tables = BTreeSet::new();
 
         for &id in &reachable {
@@ -2007,8 +2411,13 @@ impl<'a> CCodeEmitter<'a> {
                     width,
                     sample,
                 } => {
+                    let key = if *reg_slot >= 64 {
+                        (*reg_slot, name.clone())
+                    } else {
+                        (*reg_slot, String::new())
+                    };
                     reg_map
-                        .entry(*reg_slot)
+                        .entry(key)
                         .and_modify(|e| {
                             e.1 = e.1.max(*width);
                             if e.2.is_none() {
@@ -2060,7 +2469,7 @@ impl<'a> CCodeEmitter<'a> {
 
         let sym_regs: Vec<(u8, String, u8, Option<u64>)> = reg_map
             .into_iter()
-            .map(|(slot, (name, w, s))| (slot, name, w, s))
+            .map(|((slot, _), (name, w, s))| (slot, name, w, s))
             .collect();
 
         // 2. 统计父引用次数，识别需要 CSE 抽成局部变量的共享子表达式
@@ -2077,6 +2486,7 @@ impl<'a> CCodeEmitter<'a> {
             used_tables,
             need_rotr32: false,
             need_rotr64: false,
+            need_bswap16: false,
             need_bswap32: false,
             need_bswap64: false,
             need_rbit32: false,
@@ -2089,6 +2499,9 @@ impl<'a> CCodeEmitter<'a> {
             need_udiv64: false,
             need_sdiv32: false,
             need_sdiv64: false,
+            need_umulh64: false,
+            need_smulh64: false,
+            suppress_mulh_hint: false,
             cse_names: HashMap::new(),
             stmts: Vec::new(),
         };
@@ -2120,6 +2533,9 @@ impl<'a> CCodeEmitter<'a> {
         }
         if emitter.need_rotr64 {
             code.push_str("static inline uint64_t ROTR64(uint64_t x, unsigned n) { return (x >> (n & 63)) | (x << ((64 - n) & 63)); }\n");
+        }
+        if emitter.need_bswap16 {
+            code.push_str("static inline uint16_t BSWAP16(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }\n");
         }
         if emitter.need_bswap32 {
             code.push_str("static inline uint32_t BSWAP32(uint32_t x) { return __builtin_bswap32(x); }\n");
@@ -2157,8 +2573,15 @@ impl<'a> CCodeEmitter<'a> {
         if emitter.need_sdiv64 {
             code.push_str("static inline uint64_t SDIV64(uint64_t a, uint64_t b) { int64_t sa = (int64_t)a, sb = (int64_t)b; if (sb == 0) return 0ull; if (sa == (-9223372036854775807LL - 1) && sb == -1) return a; return (uint64_t)(sa / sb); }\n");
         }
+        if emitter.need_umulh64 {
+            code.push_str("#ifdef __SIZEOF_INT128__\nstatic inline uint64_t UMULH64(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) >> 64); }\n#else\nstatic inline uint64_t UMULH64(uint64_t a, uint64_t b) { uint64_t a0 = a & 0xffffffffull, a1 = a >> 32, b0 = b & 0xffffffffull, b1 = b >> 32; uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull); return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32); }\n#endif\n");
+        }
+        if emitter.need_smulh64 {
+            code.push_str("#ifdef __SIZEOF_INT128__\nstatic inline uint64_t SMULH64(uint64_t a, uint64_t b) { return (uint64_t)(((__int128)(int64_t)a * (__int128)(int64_t)b) >> 64); }\n#else\nstatic inline uint64_t SMULH64(uint64_t a, uint64_t b) { uint64_t ua = a, ub = b, hi = 0; uint64_t a0 = ua & 0xffffffffull, a1 = ua >> 32, b0 = ub & 0xffffffffull, b1 = ub >> 32; uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull); hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32); if ((int64_t)a < 0) hi -= ub; if ((int64_t)b < 0) hi -= ua; return hi; }\n#endif\n");
+        }
         if emitter.need_rotr32
             || emitter.need_rotr64
+            || emitter.need_bswap16
             || emitter.need_bswap32
             || emitter.need_bswap64
             || emitter.need_rbit32
@@ -2171,6 +2594,8 @@ impl<'a> CCodeEmitter<'a> {
             || emitter.need_udiv64
             || emitter.need_sdiv32
             || emitter.need_sdiv64
+            || emitter.need_umulh64
+            || emitter.need_smulh64
         {
             code.push('\n');
         }
@@ -2231,7 +2656,7 @@ impl<'a> CCodeEmitter<'a> {
                 sample_hex: Some(hex_bytes),
             });
         }
-        for (_, name, w, sample) in &emitter.sym_regs {
+        for (slot, name, w, sample) in &emitter.sym_regs {
             let sh = sample.map(|v| format!("0x{v:x}"));
             code.push_str(&format!(
                 " *   {} ({}b) = {}\n",
@@ -2241,7 +2666,7 @@ impl<'a> CCodeEmitter<'a> {
             ));
             out_inputs.push(DecompiledInput {
                 name: name.clone(),
-                kind: "reg",
+                kind: if *slot >= 64 { "hle_source" } else { "reg" },
                 addr: None,
                 width_bytes: (*w as usize) / 8,
                 sample_hex: sh,
@@ -2346,7 +2771,10 @@ impl<'a> CCodeEmitter<'a> {
                 }
                 BvUnOp::Bswap => {
                     let sx = self.fmt_expr(x, 0);
-                    if width <= 32 {
+                    if width <= 16 {
+                        self.need_bswap16 = true;
+                        format!("BSWAP16({sx})")
+                    } else if width <= 32 {
                         self.need_bswap32 = true;
                         format!("BSWAP32({sx})")
                     } else {
@@ -2399,15 +2827,69 @@ impl<'a> CCodeEmitter<'a> {
                         format!("ROTR64({sa}, {sb})")
                     };
                 }
-                if op == BvBinOp::Ashr {
+                if op == BvBinOp::UMulh {
+                    self.need_umulh64 = true;
                     let sa = self.fmt_expr(a, 0);
+                    let sb = self.fmt_expr(b, 0);
+                    let hint = if self.suppress_mulh_hint {
+                        String::new()
+                    } else {
+                        self.arena
+                            .as_const(b)
+                            .and_then(|m| detect_magic_udiv(m, 0))
+                            .map(|d| format!(" /* ~= / {d} */"))
+                            .unwrap_or_default()
+                    };
+                    return format!("UMULH64({sa}, {sb}){hint}");
+                }
+                if op == BvBinOp::SMulh {
+                    self.need_smulh64 = true;
+                    let sa = self.fmt_expr(a, 0);
+                    let sb = self.fmt_expr(b, 0);
+                    let hint = if self.suppress_mulh_hint {
+                        String::new()
+                    } else {
+                        self.arena
+                            .as_const(b)
+                            .and_then(|m| detect_magic_sdiv(m, 0))
+                            .map(|d| format!(" /* ~= / {d} */"))
+                            .unwrap_or_default()
+                    };
+                    return format!("SMULH64({sa}, {sb}){hint}");
+                }
+                if op == BvBinOp::Ashr {
+                    let hint = self
+                        .arena
+                        .as_const(b)
+                        .and_then(|sh| {
+                            if let BvNode::BinOp {
+                                op: BvBinOp::SMulh,
+                                b: mul_rhs,
+                                ..
+                            } = self.arena.get(a)
+                            {
+                                self.arena
+                                    .as_const(*mul_rhs)
+                                    .and_then(|m| detect_magic_sdiv(m, sh as u32))
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|d| format!(" /* ~= / {d} */"))
+                        .unwrap_or_default();
+                    let prev_sup = self.suppress_mulh_hint;
+                    if !hint.is_empty() {
+                        self.suppress_mulh_hint = true;
+                    }
+                    let sa = self.fmt_expr(a, 0);
+                    self.suppress_mulh_hint = prev_sup;
                     let sb = self.fmt_expr(b, 0);
                     return if width <= 32 {
                         self.need_ashr32 = true;
-                        format!("ASHR32({sa}, {sb})")
+                        format!("ASHR32({sa}, {sb}){hint}")
                     } else {
                         self.need_ashr64 = true;
-                        format!("ASHR64({sa}, {sb})")
+                        format!("ASHR64({sa}, {sb}){hint}")
                     };
                 }
                 if op == BvBinOp::UDiv {
@@ -2434,7 +2916,34 @@ impl<'a> CCodeEmitter<'a> {
                 }
                 if matches!(op, BvBinOp::Shl | BvBinOp::Lshr) {
                     let sym = if op == BvBinOp::Shl { "<<" } else { ">>" };
+                    let hint = if op == BvBinOp::Lshr && width >= 32 {
+                        self.arena
+                            .as_const(b)
+                            .and_then(|sh| {
+                                if let BvNode::BinOp {
+                                    op: BvBinOp::UMulh,
+                                    b: mul_rhs,
+                                    ..
+                                } = self.arena.get(a)
+                                {
+                                    self.arena
+                                        .as_const(*mul_rhs)
+                                        .and_then(|m| detect_magic_udiv(m, sh as u32))
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|d| format!(" /* ~= / {d} */"))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let prev_sup = self.suppress_mulh_hint;
+                    if !hint.is_empty() {
+                        self.suppress_mulh_hint = true;
+                    }
                     let sa_raw = self.fmt_expr(a, 14);
+                    self.suppress_mulh_hint = prev_sup;
                     let sa = if width < 32 {
                         format!("(uint32_t){sa_raw}")
                     } else {
@@ -2451,7 +2960,7 @@ impl<'a> CCodeEmitter<'a> {
                         let ty = c_uint_type(width);
                         return wrap_prec(format!("({ty})({sa} {sym} {sb})"), 14, parent_prec);
                     }
-                    return wrap_prec(format!("{sa} {sym} {sb}"), 11, parent_prec);
+                    return wrap_prec(format!("{sa} {sym} {sb}{hint}"), 11, parent_prec);
                 }
                 let (sym, prec, child_l_prec, child_r_prec) = match op {
                     BvBinOp::Mul => ("*", 13, 13, 14),
@@ -2465,6 +2974,8 @@ impl<'a> CCodeEmitter<'a> {
                     | BvBinOp::Ashr
                     | BvBinOp::UDiv
                     | BvBinOp::SDiv
+                    | BvBinOp::UMulh
+                    | BvBinOp::SMulh
                     | BvBinOp::Shl
                     | BvBinOp::Lshr => unreachable!(),
                 };
@@ -2492,9 +3003,9 @@ fn sanitize_c_ident(raw: &str) -> String {
         "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else",
         "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register",
         "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
-        "union", "unsigned", "void", "volatile", "while", "ROTR32", "ROTR64", "BSWAP32",
-        "BSWAP64", "RBIT32", "RBIT64", "CLZ32", "CLZ64", "ASHR32", "ASHR64", "UDIV32", "UDIV64",
-        "SDIV32", "SDIV64",
+        "union", "unsigned", "void", "volatile", "while", "ROTR32", "ROTR64", "BSWAP16",
+        "BSWAP32", "BSWAP64", "RBIT32", "RBIT64", "CLZ32", "CLZ64", "ASHR32", "ASHR64", "UDIV32",
+        "UDIV64", "SDIV32", "SDIV64", "UMULH64", "SMULH64",
     ];
     let trimmed = raw.trim();
     let mut out = String::with_capacity(trimmed.len());
@@ -2513,6 +3024,74 @@ fn sanitize_c_ident(raw: &str) -> String {
     } else {
         out
     }
+}
+
+/// 魔数无符号除法反推：识别编译器生成的 `UMULH64(x, M) >> s`（如 `/ 1000`、`/ 60000`）
+fn detect_magic_udiv(magic: u64, shift: u32) -> Option<u64> {
+    if magic < (1u64 << 32) || shift >= 64 {
+        return None;
+    }
+    let total_shift = 64 + shift;
+    if total_shift >= 127 {
+        return None;
+    }
+    let numer = 1u128 << total_shift;
+    let d128 = numer.div_ceil(u128::from(magic));
+    if d128 < 3 || d128 > u128::from(u32::MAX) {
+        return None;
+    }
+    let d = d128 as u64;
+    let hi_mult = (u64::MAX / d).saturating_mul(d);
+    for &probe in &[
+        0u64,
+        d - 1,
+        d,
+        d.saturating_mul(7) + 1,
+        d.saturating_mul(12345),
+        hi_mult.saturating_sub(1),
+        u64::MAX,
+    ] {
+        let got = ((u128::from(probe) * u128::from(magic)) >> total_shift) as u64;
+        if got != probe / d {
+            return None;
+        }
+    }
+    Some(d)
+}
+
+/// 魔数有符号除法反推：识别编译器生成的 `SMULH64(x, M) >> s`（如 `/ 1000`、`/ 60000`）
+fn detect_magic_sdiv(magic: u64, shift: u32) -> Option<u64> {
+    let m = magic as i64;
+    if m <= 0 || (m as u64) < (1u64 << 32) || shift >= 63 {
+        return None;
+    }
+    let total_shift = 64 + shift;
+    if total_shift >= 127 {
+        return None;
+    }
+    let numer = 1u128 << total_shift;
+    let d128 = numer.div_ceil(m as u128);
+    if d128 < 3 || d128 > u128::from(u32::MAX) {
+        return None;
+    }
+    let d = d128 as u64;
+    let di = d as i64;
+    let hi_mult = (i64::MAX / di).saturating_mul(di);
+    for &probe in &[
+        0i64,
+        di - 1,
+        di,
+        di.saturating_mul(19) + 1,
+        di.saturating_mul(10000),
+        hi_mult.saturating_sub(1),
+        i64::MAX,
+    ] {
+        let got = ((i128::from(probe) * i128::from(m)) >> total_shift) as i64;
+        if got != probe / di {
+            return None;
+        }
+    }
+    Some(d)
 }
 
 fn c_uint_type(width: u8) -> &'static str {
@@ -2691,6 +3270,12 @@ fn emit_smt2(arena: &BvArena, root: NodeId, expected_out: Option<u64>) -> String
                     BvBinOp::Add => format!("(bvadd {sa} {sb})"),
                     BvBinOp::Sub => format!("(bvsub {sa} {sb})"),
                     BvBinOp::Mul => format!("(bvmul {sa} {sb})"),
+                    BvBinOp::UMulh => format!(
+                        "((_ extract 127 64) (bvmul ((_ zero_extend 64) {sa}) ((_ zero_extend 64) {sb})))"
+                    ),
+                    BvBinOp::SMulh => format!(
+                        "((_ extract 127 64) (bvmul ((_ sign_extend 64) {sa}) ((_ sign_extend 64) {sb})))"
+                    ),
                     BvBinOp::UDiv => format!("(ite (= {sb} (_ bv0 {tw})) (_ bv0 {tw}) (bvudiv {sa} {sb}))"),
                     BvBinOp::SDiv => format!("(ite (= {sb} (_ bv0 {tw})) (_ bv0 {tw}) (bvsdiv {sa} {sb}))"),
                     BvBinOp::And => format!("(bvand {sa} {sb})"),
@@ -2790,6 +3375,9 @@ impl TraceReader {
         // 内部使用 max_steps: usize::MAX 避免截断因果链导致中段指令静默常量折叠；返回前再按 opts.max_steps 截取展示步数
         let taint_opts = TaintOptions {
             anchor_idx: opts.anchor_idx,
+            min_idx: opts.from_idx,
+            stop_at_pcs: opts.stop_at_pcs.clone(),
+            stop_mem_ranges: opts.stop_mem_ranges.clone(),
             max_insns: opts.max_insns,
             max_steps: usize::MAX,
             track_mem_index: opts.track_mem_index,
@@ -2798,11 +3386,7 @@ impl TraceReader {
         let bwd = self.taint_backward(seed, &taint_opts);
 
         let anchor_idx = bwd.anchor_idx;
-        let stop_idx = if opts.max_insns > 0 {
-            anchor_idx.saturating_sub(opts.max_insns.saturating_sub(1))
-        } else {
-            0
-        };
+        let stop_idx = bwd.stop_idx;
         let slice_idxs: HashSet<usize> = bwd.steps.iter().map(|s| s.idx).collect();
 
         // 收集反向切片给出的「输入起源」寄存器与内存字节
@@ -2819,7 +3403,7 @@ impl TraceReader {
             }
         }
 
-        // 若扫描起点大于 0，仍从 `0` 开始跟踪具体寄存器值以捕获更早建立的基址/常量寄存器
+        // 若扫描起点大于 0，仍从 `0` 开始跟踪具体寄存器值与写集合，以捕获边界寄存器初始值及可写内存集合（供 --fold-rodata 判断）
         let hle_events = self.hle_events();
         let mut hle_by_seq: HashMap<u32, Vec<HleTraceEvent>> = HashMap::new();
         for ev in hle_events {
@@ -2830,11 +3414,42 @@ impl TraceReader {
             self,
             origin_regs,
             origin_mem_addrs,
+            opts.stop_mem_ranges.clone(),
+            opts.fold_rodata,
             &opts.initial_regs,
             opts.track_sp,
         );
 
         let mut last_mem_write_bytes: HashMap<u64, u8> = HashMap::new();
+
+        // P1-3: 当开启 --fold-rodata 时，单遍线性 O(E) 预扫描整个 Trace 的 .ext 写事件（含全部 HLE），
+        // 避免逐条指令二分/分配开销，并防止「先读后写」（含 --at 之后才写入）的可变内存被误折成常量。
+        if opts.fold_rodata {
+            for i in 0..self.ext_len() {
+                if let Some(ev) = self.get_ext(i) {
+                    if ev.kind == ExtKind::MemWrite as u8 {
+                        let sz = (ev.size_or_reg as usize).clamp(1, 16);
+                        let base = ev.addr;
+                        for b in 0..sz {
+                            lifter.ever_written_mem.insert(base.wrapping_add(b as u64));
+                        }
+                    }
+                }
+            }
+            for ev in hle_by_seq.values().flatten() {
+                let is_mem_writer = matches!(
+                    ev.op,
+                    "memcpy" | "memmove" | "realloc_copy" | "memset" | "bzero" | "calloc_zero"
+                ) || (is_hle_entropy_or_time_mem(ev.op) && ev.dst != 0)
+                    || (ev.op == "time" && ev.dst != 0);
+                if is_mem_writer && ev.dst != 0 {
+                    let len = ev.len.min(64 * 1024);
+                    for i in 0..len {
+                        lifter.ever_written_mem.insert(ev.dst.wrapping_add(i));
+                    }
+                }
+            }
+        }
 
         if !self.is_empty() {
             let end_idx = anchor_idx.min(self.len() - 1);
@@ -2846,15 +3461,19 @@ impl TraceReader {
                 let mem_evs = self.mem_events_for(idx);
                 let post_deltas = self.reg_deltas_for(idx);
 
-                // 记录内存写具体值以便计算最终输出 `expected_output`
+                // 记录内存写具体值与曾被写入的地址集合（用于 expected_output 与 --fold-rodata）
                 for ev in &mem_evs {
                     if ev.kind == ExtKind::MemWrite as u8 {
-                        let sz = (ev.size_or_reg as usize).clamp(1, 8);
+                        let sz = (ev.size_or_reg as usize).clamp(1, 16);
                         for b in 0..sz {
-                            last_mem_write_bytes.insert(
-                                ev.addr.wrapping_add(b as u64),
-                                ((ev.value >> (b * 8)) & 0xFF) as u8,
-                            );
+                            let a = ev.addr.wrapping_add(b as u64);
+                            lifter.ever_written_mem.insert(a);
+                            if b < 8 {
+                                last_mem_write_bytes
+                                    .insert(a, ((ev.value >> (b * 8)) & 0xFF) as u8);
+                            } else {
+                                last_mem_write_bytes.remove(&a);
+                            }
                         }
                     }
                 }
@@ -2899,9 +3518,45 @@ impl TraceReader {
                 }
                 if let Some(evs) = hle_by_seq.get(&seq) {
                     if idx >= stop_idx {
-                        lifter.apply_hle_events(evs);
+                        lifter.apply_hle_events(evs, &last_mem_write_bytes);
+                        // 外部熵源/时钟源 HLE：直接将 X0 或写入缓冲提升为具名符号（如 rand_0 / time_0），并保留真实样本值！
+                        for ev in evs {
+                            if is_hle_entropy_or_time_reg(ev.op) && slice_idxs.contains(&idx) {
+                                let sample = post_deltas
+                                    .iter()
+                                    .find(|&&(r, _)| r == 0)
+                                    .map(|&(_, v)| v)
+                                    .or(Some(ev.src));
+                                let sym = lifter.alloc_entropy_sym(ev.op, 64, sample);
+                                lifter.sym_regs[0] = Some(sym);
+                            }
+                            let is_hle_mem_source = (is_hle_entropy_or_time_mem(ev.op)
+                                || ev.op == "time")
+                                && ev.dst != 0
+                                && ev.len > 0;
+                            if is_hle_mem_source {
+                                let len = ev.len.min(64 * 1024);
+                                let first8 = ev.src.to_le_bytes();
+                                for b in 0..len {
+                                    let a = ev.dst.wrapping_add(b);
+                                    if b < 8 && slice_idxs.contains(&idx) {
+                                        let node = lifter
+                                            .arena
+                                            .sym_mem_byte(a, Some(first8[b as usize]));
+                                        lifter.sym_mem.insert(a, node);
+                                    } else {
+                                        // bytes >= 8（如 tv_usec/tv_nsec/getrandom[8..]）：清除旧 sym_mem 并标记为起源地址，
+                                        // 令后续 LDR 从真实 MemRead 样本中延迟构造精确 SymMemByte！
+                                        lifter.sym_mem.remove(&a);
+                                        if slice_idxs.contains(&idx) {
+                                            lifter.origin_mem_addrs.insert(a);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    // 同步具体内存镜像（针对 HLE memcpy/memset）
+                    // 同步具体内存镜像与 ever_written_mem（针对 HLE memcpy/memset/entropy）
                     for ev in evs {
                         match ev.op {
                             "memcpy" | "memmove" | "realloc_copy" => {
@@ -2915,6 +3570,7 @@ impl TraceReader {
                                     })
                                     .collect();
                                 for (d, v) in snap {
+                                    lifter.ever_written_mem.insert(d);
                                     if let Some(b) = v {
                                         last_mem_write_bytes.insert(d, b);
                                     } else {
@@ -2926,7 +3582,24 @@ impl TraceReader {
                                 let len = ev.len.min(64 * 1024);
                                 let fill = (ev.src & 0xFF) as u8;
                                 for i in 0..len {
-                                    last_mem_write_bytes.insert(ev.dst.wrapping_add(i), fill);
+                                    let d = ev.dst.wrapping_add(i);
+                                    lifter.ever_written_mem.insert(d);
+                                    last_mem_write_bytes.insert(d, fill);
+                                }
+                            }
+                            op if (is_hle_entropy_or_time_mem(op) || op == "time")
+                                && ev.dst != 0 =>
+                            {
+                                let len = ev.len.min(64 * 1024);
+                                let first8 = ev.src.to_le_bytes();
+                                for i in 0..len {
+                                    let d = ev.dst.wrapping_add(i);
+                                    lifter.ever_written_mem.insert(d);
+                                    if i < 8 {
+                                        last_mem_write_bytes.insert(d, first8[i as usize]);
+                                    } else {
+                                        last_mem_write_bytes.remove(&d);
+                                    }
                                 }
                             }
                             _ => {}
@@ -2976,7 +3649,7 @@ impl TraceReader {
                     }
                 }
                 let exp = all_known.then_some(exp_acc);
-                let expr = lifter.load_sym_bytes(addr, eff_len, exp);
+                let expr = lifter.load_sym_bytes_ex(addr, eff_len, exp, false);
                 (expr, exp)
             }
         };
@@ -3020,12 +3693,14 @@ impl TraceReader {
         DecompileReport {
             seed_desc: bwd.seed_desc,
             anchor_idx: bwd.anchor_idx,
+            stop_idx,
             scanned_insns: bwd.scanned_insns,
             slice_insns,
             raw_nodes,
             simplified_nodes,
             inputs,
             tables,
+            origin_annotations: bwd.origin_annotations,
             expected_output,
             evaluated_output,
             verified,

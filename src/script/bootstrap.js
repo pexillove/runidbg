@@ -1487,6 +1487,8 @@
       return {
         totalInsns: info.totalInsns,
         totalExt: info.totalExt,
+        missingExtWarning: Boolean(info.missingExtWarning),
+        recordedLevel: info.recordedLevel || null,
         query(opts) {
           return __native.traceQuery(traceId, opts || {});
         },
@@ -1499,14 +1501,23 @@
             Object.assign({ writesOnly: false }, opts || {}, { addr })
           );
         },
+        findMem(addr, opts = {}) {
+          return __native.traceQuery(
+            traceId,
+            Object.assign({}, opts || {}, { addr })
+          );
+        },
         hleEvents(limit = 500) {
           return __native.traceHleEvents(traceId, Number(limit));
         },
         reconstructMem(addr, len, atSeq) {
+          if (typeof len !== "number") {
+            throw new TypeError("reconstructMem 参数 len 必须为非负整数");
+          }
           return __native.traceReconstructMem(
             traceId,
             addr,
-            Number(len),
+            len,
             atSeq !== undefined && atSeq !== null ? atSeq : null
           );
         },
@@ -1532,6 +1543,21 @@
     },
     diff(idxA, idxB, maxDiffs = 100) {
       return __native.traceDiff(String(idxA), String(idxB), Number(maxDiffs));
+    },
+    diffTaint(idxA, idxB, addr, len = 16, maxInsns = 0) {
+      if (typeof len !== "number") {
+        throw new TypeError("Trace.diffTaint 参数 len 必须为整数 (1..=4096)");
+      }
+      if (typeof maxInsns !== "number") {
+        throw new TypeError("Trace.diffTaint 参数 maxInsns 必须为非负整数");
+      }
+      return __native.traceDiffTaint(
+        String(idxA),
+        String(idxB),
+        addr,
+        len,
+        maxInsns
+      );
     },
   };
 })(globalThis);

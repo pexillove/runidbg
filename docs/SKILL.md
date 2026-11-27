@@ -1,6 +1,6 @@
 ---
 name: runidbg
-description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries across 4 backends (Unicorn/Dynarmic/KVM/Hypervisor), assemble/relocate ARM64 patches with built-in good64, write QuickJS JNI/Hook/VM/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction + HLE traces, run offline byte-granular taint/slicing and slice-to-C decompilation (with MBA simplification & SMT-LIB2), omniscient query, dual-run diff, custom VM analysis, `.rtape` time-travel debugging, multi-core HTTP/JSON-RPC services, embedded Web UI, MCP (38 tools), or GDB RSP.
+description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries across 4 backends (Unicorn/Dynarmic/KVM/Hypervisor), assemble/relocate ARM64 patches with built-in good64, write QuickJS JNI/Hook/VM/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction + HLE traces, run offline byte-granular taint/slicing and slice-to-C decompilation (with --from-seq/--stop-at-pc/--stop-mem/--fold-rodata, byte-reassembly & MBA simplification, UMULH/SMULH magic-div recovery & SMT-LIB2), offline memory reconstruction (`mem`), omniscient query, dual-run diff-taint linkage, custom VM analysis, `.rtape` time-travel debugging, multi-core HTTP/JSON-RPC services, embedded Web UI, MCP (39 tools), or GDB RSP.
 ---
 
 # runidbg Agent Skill
@@ -30,7 +30,7 @@ codesign --force --sign - --entitlements entitlements/hypervisor.plist target/re
 4. **Trace truncation & level**:
    - `fast`: PC + opcode only (no `.ext`).
    - `reg_delta` (default): PC + opcode + register deltas (no memory `.ext`).
-   - `full`: registers + guest memory R/W + **HLE `memcpy`/`memmove`/`memset`/`bzero`/`malloc`/`calloc`/`realloc`/`free`** in `.ext` (required for `taint`, `vm`, `find --addr/--bytes`, and `Trace.open().query()`).
+   - `full`: registers + guest memory R/W + **HLE `memcpy`/`memmove`/`memset`/`bzero`/`malloc`/`calloc`/`realloc`/`free` + entropy/clock sources (`rand`/`getrandom`/`gettimeofday`/`clock_gettime`/`time`)** in `.ext` (required for `taint`, `decompile`, `mem`, `vm`, `find --addr/--bytes`, and `Trace.open().query()`; missing sibling `.ext` emits an explicit `WARN`).
    - Default `capacity` is `262144`. Always check `const st = emu.trace.stop(); if (st.truncated) ...` and raise `capacity` if truncated!
 5. **`rand()` / `srand()` stub**: HLE `rand`/`random`/`srand`/`srandom` use a deterministic `xorshift64*` PRNG (not glibc TYPE_3), logging a one-time warning. Override via `emu.hook.importReplace("rand", ...)` if a target depends on a specific sequence.
 6. **Backend choice**: `unicorn` is required for Trace, GDB RSP, and native code/mem/syscall hooks; use `dynarmic`, `hypervisor` (macOS), or `kvm` (Linux) for pure emulation acceleration, and relay via `.rtape` (`saveTape` -> `Emu.loadTape(..., { backend: "unicorn" })`) when fast-forwarding initialization.
@@ -122,14 +122,14 @@ const st = emu.trace.stop();
 if (st.truncated) console.warn("Trace truncated!", st);
 
 // Offline omniscient query, backward causal slicing & VM auto-analysis right in JS:
-const tr = Trace.open("run.idx");
-const writes = tr.findWrites(0xdeadbeefn, { width: 4 });
-const hist   = tr.findReads(0x50006470, { len: 8 });
-const snap   = tr.reconstructMem(0x50006470, 16);
-const slice  = tr.taintBackward({ addr: 0x50006470, len: 8 });
-const pseudo = tr.taintToC({ addr: 0x50006470, len: 4, emitSmt2: true });
+const tr = Trace.open("run.idx"); // check tr.missingExtWarning / tr.recordedLevel
+const writes = tr.findWrites(0xdeadbeefn, { width: 4 }); // lossless BigInt hit.value64
+const hist   = tr.findMem(0x50006470, { kind: "w", len: 8, minSeq: 1000, maxSeq: 50000, includeHle: false });
+const snap   = tr.reconstructMem(0x50006470, 16); // snap.bytes is a Uint8Array
+const slice  = tr.taintBackward({ addr: 0x50006470, len: 8, fromIdx: 1000, stopAtPcs: [0x40001200] });
+const pseudo = tr.taintToC({ addr: 0x50006470, len: 8, fromIdx: 1000, foldRodata: true, emitSmt2: true });
 const fwd    = tr.taintForward({ addr: 0x50001000, len: 16 });
-const vmRep  = tr.vmAnalyze({ baseReg: "x25", layout: { op: [6, 6], fields: [12, 17, 22, 27] } });
+const vmRep  = tr.vmAnalyze({ minIdx: 1821500, maxIdx: 1824500, baseReg: "x25", layout: { op: [6, 6], fields: [12, 17, 22, 27] } });
 tr.close();
 
 // Built-in good64 zero-dep ARM64 assembler, relocator & Inline Hook helpers:
@@ -138,7 +138,8 @@ const reloc  = Emu.relocateAsm(stub, 0x40001000, 0x80001000);
 emu.mem.patchAsm(mod.base + 0x1000, "mov x0, #1; ret");
 emu.mem.inlineJump(mod.base + 0x2000, mod.base + 0x1000);
 
-const diff = Trace.diff("run_a.idx", "run_b.idx");
+const diff      = Trace.diff("run_a.idx", "run_b.idx");
+const diffTaint = Trace.diffTaint("run_a.idx", "run_b.idx", 0x50006850, 32);
 ```
 
 Offline CLI equivalents:
@@ -147,14 +148,15 @@ runidbg-cli stats       run.idx --base 0x40000000 --top 20
 runidbg-cli calltree    run.idx --base 0x40000000 --max-depth 4 --min-insns 1000
 runidbg-cli crypto-scan run.idx --base 0x40000000
 runidbg-cli dump        run.idx --base 0x40000000 --skip 0 --limit 50
+runidbg-cli mem         run.idx --addr 0x50006170 --len 576 --at 1820000
 runidbg-cli find        run.idx --base 0x40000000 --val 0x03000001
-runidbg-cli find        run.idx --base 0x40000000 --addr 0x50006470 --limit 50
+runidbg-cli find        run.idx --addr 0x50006470 --len 8 --seq-range 1000..50000 --only-writes --no-hle
 runidbg-cli find        run.idx --base 0x40000000 --ascii "8404" --limit 10
 runidbg-cli asm         "paciasp; ubfx x0, x1, #4, #8; ret" --pc 0x40001000
-runidbg-cli taint       run.idx --mode backward --addr 0x50006470 --len 8 --base 0x40000000
-runidbg-cli decompile   run.idx --addr 0x50006470 --len 4 --fn round_fn --smt2
-runidbg-cli diff        run_a.idx run_b.idx --base 0x40000000 --limit 50
-runidbg-cli vm          run.idx --base 0x40000000 --base-reg x25 --layout 6:6,12,17,22,27
+runidbg-cli taint       run.idx --mode backward --addr 0x50006470 --len 8 --from-seq 1922597 --base 0x40000000
+runidbg-cli decompile   run.idx --addr 0x50006470 --len 8 --from-seq 1922597 --fold-rodata --fn round_fn --smt2
+runidbg-cli diff        run_a.idx run_b.idx --target-addr 0x50006850 --len 32
+runidbg-cli vm          run.idx --seq-range 1821500..1824500 --base 0x40000000 --base-reg x25 --layout 6:6,12,17,22,27
 runidbg-cli export-ida  run.idx --base 0x40000000 --out ida_cov.py
 runidbg-cli export-bn   run.idx --base 0x40000000 --out bn_cov.py
 ```
@@ -175,12 +177,12 @@ const writer = tt.findPrevWrite(dst, 8);
 tt.close();
 ```
 
-### Using MCP Tools (38 Tools for Direct AI Agent Control)
+### Using MCP Tools (39 Tools for Direct AI Agent Control)
 Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`):
 - **Lifecycle & Execution**: `emu_create` (supports `backend`, `freezeLayout`), `emu_load`, `emu_jni_onload`, `emu_exports`, `emu_call`, `emu_eval_js`
 - **DEX & JNI**: `emu_load_dex`, `emu_dex_class_info`, `emu_jni_set_field`, `emu_jni_call_native`
 - **Inspection, Memory & Assembler**: `emu_regs`, `emu_mem_read`, `emu_mem_scan`, `emu_disasm`, `emu_asm`
-- **Tracing, Taint, Slice-to-C, Diff, VM & Hooks**: `emu_trace_call`, `trace_inspect`, `trace_calltree`, `trace_crypto_scan`, `trace_taint`, `trace_decompile`, `trace_query`, `trace_diff`, `trace_vm_analyze`, `emu_hook_capture`
+- **Tracing, Taint, Slice-to-C, Mem, Diff, VM & Hooks**: `emu_trace_call`, `trace_inspect`, `trace_calltree`, `trace_crypto_scan`, `trace_taint`, `trace_decompile`, `trace_mem`, `trace_query`, `trace_diff`, `trace_vm_analyze`, `emu_hook_capture`
 - **`.rtape` & Time-Travel**: `emu_save_tape`, `emu_load_tape`, `emu_seek_tape`, `tape_info`, `tt_record_start`, `tt_record_stop`, `tt_open`, `tt_seek`, `tt_reverse_watch`, `tt_mem_read`, `tt_close`
 - **Diagnostics**: `emu_diag_missing`, `emu_last_crash`
 

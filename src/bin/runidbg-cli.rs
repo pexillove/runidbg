@@ -35,6 +35,64 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn parse_seq_range(s: &str) -> Result<(Option<usize>, Option<usize>)> {
+    let (lhs, rhs, inclusive_end) = if let Some((a, b)) = s.split_once("..=") {
+        (a, b, true)
+    } else if let Some((a, b)) = s.split_once("..") {
+        (a, b, false)
+    } else {
+        bail!("无效的 --seq-range 格式 `{s}`（期望 `<start>..<end>` 半开或 `<start>..=<end>` 闭区间）");
+    };
+    let start = if lhs.trim().is_empty() {
+        None
+    } else {
+        Some(lhs.trim().parse::<usize>().with_context(|| format!("无效的起始序号: {lhs}"))?)
+    };
+    let end = if rhs.trim().is_empty() {
+        None
+    } else {
+        let raw_end = rhs.trim().parse::<usize>().with_context(|| format!("无效的结束序号: {rhs}"))?;
+        if inclusive_end {
+            Some(raw_end)
+        } else {
+            if raw_end == 0 {
+                bail!("--seq-range 半开区间 `{s}` 上界不能为 0");
+            }
+            Some(raw_end - 1)
+        }
+    };
+    if let (Some(a), Some(b)) = (start, end) {
+        if a > b {
+            bail!("--seq-range 区间 `{s}` 为空或起始序号大于结束序号");
+        }
+    }
+    Ok((start, end))
+}
+
+fn parse_stop_mem(s: &str) -> Result<(u64, usize)> {
+    if let Some((a, l)) = s.split_once(':') {
+        let addr = parse_u64_hex_or_dec(a.trim())?;
+        let len = l.trim().parse::<usize>().with_context(|| format!("无效的 --stop-mem 长度: {l}"))?;
+        if len == 0 || len > 65536 {
+            bail!("--stop-mem 长度必须在 1..=65536 之间");
+        }
+        Ok((addr, len))
+    } else {
+        let addr = parse_u64_hex_or_dec(s.trim())?;
+        Ok((addr, 8))
+    }
+}
+
+fn warn_if_missing_ext(reader: &TraceReader, idx_path: &std::path::Path) {
+    if reader.missing_ext_warning() {
+        let lvl = reader.recorded_level_name().unwrap_or("full");
+        eprintln!(
+            "WARN: {} 录制于 {lvl} 级别但未加载到伴生 .ext 文件（扩展事件=0）；请确认同级 .ext 未遗漏或通过 --ext 指定路径",
+            idx_path.display()
+        );
+    }
+}
+
 fn print_usage() {
     let compiled_backends = runidbg_arm64_emu_tracer::BackendKind::compiled_names();
     eprintln!(
@@ -54,16 +112,18 @@ fn print_usage() {
            runidbg-cli asm \"<insns>\" [--pc <hex>]                                             使用内置 good64 汇编器将 ARM64 汇编转为机器码并反汇编校验\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
            runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
-           runidbg-cli search|find <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
-                     [--ascii <text>] [--bytes <hex>] [--limit N]\n\
+           runidbg-cli search|find <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex> [--len N]] [--pc <hex>]\n\
+                     [--ascii <text>] [--bytes <hex>] [--seq-range <start>..<end>] [--only-writes|--only-reads] [--no-hle] [--limit N]\n\
+           runidbg-cli mem <trace.idx> --addr <hex> --len <N> [--at <seq>] [--ext <trace.ext>] [--hex|--hexdump|--out <file.bin>]\n\
            runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N]\n\
+                     [--target-addr <hex> [--len N] [--max-insns N]]\n\
            runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>)\n\
-                     [--at <idx>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]\n\
+                     [--at <idx>] [--from-seq <idx>] [--stop-at-pc <hex>] [--stop-mem <hex[:len]>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]\n\
            runidbg-cli decompile <trace.idx> [--ext <trace.ext>] (--addr <hex> [--len N] | --reg <x0>)\n\
-                     [--at <idx>] [--fn <name>] [--no-simplify] [--smt2] [--out <slice.c>]\n\
+                     [--at <idx>] [--from-seq <idx>] [--stop-at-pc <hex>] [--stop-mem <hex[:len]>] [--fold-rodata] [--fn <name>] [--no-simplify] [--smt2] [--out <slice.c>]\n\
            runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref]\n\
                      [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8]\n\
-                     [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--base <hex>] [--limit N] [--max-insns N]\n\
+                     [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--seq-range <start>..<end>] [--base <hex>] [--limit N] [--max-insns N]\n\
            runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli calltree <trace.idx> [--base <hex>] [--max-depth N] [--min-insns N]\n\
            runidbg-cli crypto-scan <trace.idx> [--ext <trace.ext>] [--base <hex>]\n\
@@ -391,10 +451,10 @@ fn ui_command(args: &[String]) -> Result<()> {
     }
 
     if ext_path.is_none() {
-        let sibling = input_path.with_extension("ext");
-        if sibling != input_path && sibling.is_file() {
-            ext_path = Some(sibling);
-        }
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&input_path);
+    }
+    if let Ok(probe_reader) = TraceReader::open(&input_path, ext_path.as_deref()) {
+        warn_if_missing_ext(&probe_reader, &input_path);
     }
 
     let handle = runidbg_arm64_emu_tracer::ui::start_trace_ui_server(
@@ -674,8 +734,17 @@ fn debug_gdb_command(args: &[String]) -> Result<()> {
 }
 
 fn diff_command(args: &[String]) -> Result<()> {
+    let usage = "用法: runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N] [--target-addr <hex> [--len N] [--max-insns N]]";
+    if args
+        .first()
+        .map(String::as_str)
+        .is_some_and(|a| matches!(a, "-h" | "--help"))
+    {
+        eprintln!("{usage}");
+        return Ok(());
+    }
     if args.len() < 2 {
-        bail!("用法: runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N]");
+        bail!("{usage}");
     }
     let a_idx = PathBuf::from(&args[0]);
     let b_idx = PathBuf::from(&args[1]);
@@ -683,6 +752,9 @@ fn diff_command(args: &[String]) -> Result<()> {
     let mut b_ext: Option<PathBuf> = None;
     let mut base_addr: u64 = 0;
     let mut limit: usize = 64;
+    let mut target_addr: Option<u64> = None;
+    let mut target_len: usize = 16;
+    let mut max_insns: usize = 0;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -705,6 +777,22 @@ fn diff_command(args: &[String]) -> Result<()> {
                     bail!("--limit 必须 >= 1");
                 }
             }
+            "--target-addr" | "--addr" => {
+                let flag = args[i].as_str();
+                let v = take_flag_value(args, &mut i, "diff", flag)?;
+                target_addr = Some(parse_u64_hex_or_dec(v)?);
+            }
+            "--len" => {
+                let v = take_flag_value(args, &mut i, "diff", "--len")?;
+                target_len = v.parse::<usize>().context("无效的 --len 值")?;
+                if target_len == 0 || target_len > 4096 {
+                    bail!("diff --len 必须在 1..=4096 之间");
+                }
+            }
+            "--max-insns" => {
+                let v = take_flag_value(args, &mut i, "diff", "--max-insns")?;
+                max_insns = v.parse::<usize>().context("无效的 --max-insns 值")?;
+            }
             other => bail!("diff 未知参数: {other}"),
         }
     }
@@ -716,6 +804,13 @@ fn diff_command(args: &[String]) -> Result<()> {
     }
     let ra = TraceReader::open(&a_idx, a_ext.as_deref())?;
     let rb = TraceReader::open(&b_idx, b_ext.as_deref())?;
+    warn_if_missing_ext(&ra, &a_idx);
+    warn_if_missing_ext(&rb, &b_idx);
+    if let Some(taddr) = target_addr {
+        let report = TraceReader::diff_taint_bytes(&ra, &rb, taddr, target_len, max_insns);
+        print!("{}", report.format_summary());
+        return Ok(());
+    }
     let summary = TraceReader::diff_traces(&ra, &rb, limit);
     let fmt_rel = |pc: u64| -> String {
         if base_addr != 0 && pc >= base_addr {
@@ -750,10 +845,13 @@ fn diff_command(args: &[String]) -> Result<()> {
 }
 
 fn taint_command(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        bail!(
-            "用法: runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>) [--at <idx>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]"
-        );
+    let usage = "用法: runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>) [--at <idx>] [--from-seq <idx>] [--stop-at-pc <hex>] [--stop-mem <hex[:len]>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]";
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
+        if args.is_empty() {
+            bail!("{usage}");
+        }
+        eprintln!("{usage}");
+        return Ok(());
     }
     let idx_path = PathBuf::from(&args[0]);
     let mut ext_path: Option<PathBuf> = None;
@@ -762,6 +860,9 @@ fn taint_command(args: &[String]) -> Result<()> {
     let mut target_len: usize = 8;
     let mut target_reg: Option<String> = None;
     let mut anchor_idx: Option<usize> = None;
+    let mut min_idx: Option<usize> = None;
+    let mut stop_at_pcs: Vec<u64> = Vec::new();
+    let mut stop_mem_ranges: Vec<(u64, usize)> = Vec::new();
     let mut max_insns: usize = 0;
     let mut limit: usize = 256;
     let mut base_addr: u64 = 0;
@@ -798,6 +899,19 @@ fn taint_command(args: &[String]) -> Result<()> {
                 let flag = args[i].as_str();
                 let v = take_flag_value(args, &mut i, "taint", flag)?;
                 anchor_idx = Some(v.parse().context("无效的 --at 值")?);
+            }
+            "--from-seq" | "--min-idx" => {
+                let flag = args[i].as_str();
+                let v = take_flag_value(args, &mut i, "taint", flag)?;
+                min_idx = Some(v.parse().context("无效的 --from-seq 值")?);
+            }
+            "--stop-at-pc" => {
+                let v = take_flag_value(args, &mut i, "taint", "--stop-at-pc")?;
+                stop_at_pcs.push(parse_u64_hex_or_dec(v)?);
+            }
+            "--stop-mem" => {
+                let v = take_flag_value(args, &mut i, "taint", "--stop-mem")?;
+                stop_mem_ranges.push(parse_stop_mem(v)?);
             }
             "--max-insns" => {
                 let v = take_flag_value(args, &mut i, "taint", "--max-insns")?;
@@ -844,8 +958,12 @@ fn taint_command(args: &[String]) -> Result<()> {
         ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
     }
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    warn_if_missing_ext(&reader, &idx_path);
     let opts = runidbg_arm64_emu_tracer::tracer::TaintOptions {
         anchor_idx,
+        min_idx,
+        stop_at_pcs,
+        stop_mem_ranges,
         max_insns,
         max_steps: limit,
         track_mem_index,
@@ -861,7 +979,7 @@ fn taint_command(args: &[String]) -> Result<()> {
 }
 
 fn decompile_command(args: &[String]) -> Result<()> {
-    let usage = "用法: runidbg-cli decompile <trace.idx> [--ext <trace.ext>] (--addr <hex> [--len N] | --reg <x0>) [--at <idx>] [--max-insns N] [--max-steps N] [--fn <name>] [--no-simplify] [--smt2] [--no-mem-index] [--track-sp] [--out <slice.c>]";
+    let usage = "用法: runidbg-cli decompile <trace.idx> [--ext <trace.ext>] (--addr <hex> [--len N] | --reg <x0>) [--at <idx>] [--from-seq <idx>] [--stop-at-pc <hex>] [--stop-mem <hex[:len]>] [--fold-rodata] [--max-insns N] [--max-steps N] [--fn <name>] [--no-simplify] [--smt2] [--no-mem-index] [--track-sp] [--out <slice.c>]";
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
         if args.is_empty() {
             bail!("{usage}");
@@ -904,6 +1022,23 @@ fn decompile_command(args: &[String]) -> Result<()> {
             "--at" => {
                 let v = take_flag_value(args, &mut i, "decompile", "--at")?;
                 opts.anchor_idx = Some(v.parse().context("无效的 --at 值")?);
+            }
+            "--from-seq" | "--min-idx" => {
+                let flag = args[i].as_str();
+                let v = take_flag_value(args, &mut i, "decompile", flag)?;
+                opts.from_idx = Some(v.parse().context("无效的 --from-seq 值")?);
+            }
+            "--stop-at-pc" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--stop-at-pc")?;
+                opts.stop_at_pcs.push(parse_u64_hex_or_dec(v)?);
+            }
+            "--stop-mem" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--stop-mem")?;
+                opts.stop_mem_ranges.push(parse_stop_mem(v)?);
+            }
+            "--fold-rodata" => {
+                opts.fold_rodata = true;
+                i += 1;
             }
             "--fn" => {
                 opts.function_name =
@@ -962,6 +1097,7 @@ fn decompile_command(args: &[String]) -> Result<()> {
         ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
     }
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    warn_if_missing_ext(&reader, &idx_path);
     let report = reader.decompile_slice(&seed, &opts);
     let summary = report.format_summary();
     if let Some(out) = out_path {
@@ -981,7 +1117,7 @@ fn decompile_command(args: &[String]) -> Result<()> {
 }
 
 fn vm_command(args: &[String]) -> Result<()> {
-    let usage = "用法: runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref] [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8] [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--base <hex>] [--limit N] [--max-insns N]";
+    let usage = "用法: runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref] [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8] [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--seq-range <start>..<end>] [--base <hex>] [--limit N] [--max-insns N]";
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
         if args.is_empty() {
             bail!("{usage}");
@@ -1064,6 +1200,12 @@ fn vm_command(args: &[String]) -> Result<()> {
                 let v = take_flag_value(args, &mut i, "vm", "--max-insns")?;
                 opts.max_insns = v.parse().context("无效的 --max-insns 值")?;
             }
+            "--seq-range" => {
+                let v = take_flag_value(args, &mut i, "vm", "--seq-range")?;
+                let (s, e) = parse_seq_range(v)?;
+                opts.min_idx = s;
+                opts.max_idx = e;
+            }
             "--limit" => {
                 let v = take_flag_value(args, &mut i, "vm", "--limit")?;
                 let lim = v.parse::<usize>().context("无效的 --limit 值")?;
@@ -1101,8 +1243,133 @@ fn vm_command(args: &[String]) -> Result<()> {
         ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
     }
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    warn_if_missing_ext(&reader, &idx_path);
     let report = reader.analyze_vm(&opts);
     print!("{}", report.format_summary(base_addr));
+    Ok(())
+}
+
+fn mem_command(args: &[String]) -> Result<()> {
+    const MAX_MEM_RECONSTRUCT_LEN: usize = 16 * 1024 * 1024;
+    let usage = "用法: runidbg-cli mem <trace.idx> --addr <hex> [--len N] [--at <seq>] [--ext <trace.ext>] [--hex|--hexdump|--out <file.bin>]";
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
+        if args.is_empty() {
+            bail!("{usage}");
+        }
+        eprintln!("{usage}");
+        return Ok(());
+    }
+    let idx_path = PathBuf::from(&args[0]);
+    let mut ext_path: Option<PathBuf> = None;
+    let mut addr: Option<u64> = None;
+    let mut len: usize = 64;
+    let mut at_seq: u32 = u32::MAX;
+    let mut hex_only = false;
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" => {
+                ext_path = Some(PathBuf::from(take_flag_value(args, &mut i, "mem", "--ext")?));
+            }
+            "--addr" => {
+                let v = take_flag_value(args, &mut i, "mem", "--addr")?;
+                addr = Some(parse_u64_hex_or_dec(v)?);
+            }
+            "--len" => {
+                let v = take_flag_value(args, &mut i, "mem", "--len")?;
+                len = v.parse::<usize>().context("无效的 --len 值")?;
+                if len == 0 || len > MAX_MEM_RECONSTRUCT_LEN {
+                    bail!("mem --len 必须在 1..={MAX_MEM_RECONSTRUCT_LEN} 之间");
+                }
+            }
+            "--at" | "--at-seq" => {
+                let flag = args[i].as_str();
+                let v = take_flag_value(args, &mut i, "mem", flag)?;
+                let n = parse_u64_hex_or_dec(v)?;
+                at_seq = n.min(u32::MAX as u64) as u32;
+            }
+            "--hex" => {
+                hex_only = true;
+                i += 1;
+            }
+            "--hexdump" => {
+                hex_only = false;
+                i += 1;
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(take_flag_value(args, &mut i, "mem", "--out")?));
+            }
+            other => bail!("mem 未知参数: {other}"),
+        }
+    }
+    let target_addr = addr.ok_or_else(|| anyhow::anyhow!("mem 必须提供 --addr <hex>"))?;
+    if ext_path.is_none() {
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
+    }
+    let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    warn_if_missing_ext(&reader, &idx_path);
+    let bytes = reader.reconstruct_mem_at(target_addr, len, at_seq);
+    let known = bytes.iter().filter(|b| b.is_some()).count();
+    let seq_label = if at_seq == u32::MAX {
+        "END".to_string()
+    } else {
+        at_seq.to_string()
+    };
+
+    if let Some(out) = out_path {
+        let raw: Vec<u8> = bytes.iter().map(|b| b.unwrap_or(0)).collect();
+        fs::write(&out, &raw)?;
+        println!(
+            "已导出重建内存 0x{target_addr:016x} ({len}B, 已知 {known}/{len}B, at_seq={seq_label}) 到 {}",
+            out.display()
+        );
+        return Ok(());
+    }
+    if hex_only {
+        let cap = len
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("mem --len 过大导致缓冲区溢出"))?;
+        let mut s = String::with_capacity(cap);
+        for b in &bytes {
+            match b {
+                Some(v) => s.push_str(&format!("{v:02x}")),
+                None => s.push_str("??"),
+            }
+        }
+        println!("{s}");
+        return Ok(());
+    }
+    println!(
+        "# 内存重建: addr=0x{target_addr:016x} len={len}B at_seq={seq_label} known={known}/{len}"
+    );
+    for row in (0..len).step_by(16) {
+        let row_addr = target_addr.wrapping_add(row as u64);
+        let mut hex_col = String::with_capacity(48);
+        let mut ascii_col = String::with_capacity(16);
+        for col in 0..16 {
+            if let Some(mb) = bytes.get(row + col) {
+                match *mb {
+                    Some(v) => {
+                        hex_col.push_str(&format!("{v:02x} "));
+                        ascii_col.push(if v.is_ascii_graphic() || v == b' ' {
+                            v as char
+                        } else {
+                            '.'
+                        });
+                    }
+                    None => {
+                        hex_col.push_str("?? ");
+                        ascii_col.push('?');
+                    }
+                }
+            } else {
+                hex_col.push_str("   ");
+            }
+        }
+        println!("0x{row_addr:016x}: {hex_col} |{ascii_col}|");
+    }
     Ok(())
 }
 
@@ -1158,6 +1425,7 @@ fn main() -> Result<()> {
         "taint" => return taint_command(&args[2..]),
         "decompile" => return decompile_command(&args[2..]),
         "vm" => return vm_command(&args[2..]),
+        "mem" => return mem_command(&args[2..]),
         "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),
         "-h" | "--help" | "help" => {
@@ -1178,6 +1446,12 @@ fn main() -> Result<()> {
     let mut limit: usize = usize::MAX;
     let mut val_filter: Option<u64> = None;
     let mut addr_filter: Option<u64> = None;
+    let mut addr_len: u64 = 1;
+    let mut min_seq: Option<usize> = None;
+    let mut max_seq: Option<usize> = None;
+    let mut only_writes = false;
+    let mut only_reads = false;
+    let mut include_hle = true;
     let mut pc_filter: Option<u64> = None;
     let mut ascii_filter: Option<String> = None;
     let mut bytes_filter: Option<Vec<u8>> = None;
@@ -1212,6 +1486,46 @@ fn main() -> Result<()> {
                 addr_filter = Some(parse_u64_hex_or_dec(take_flag_value(
                     &args, &mut i, cmd, "--addr",
                 )?)?);
+            }
+            "--len" => {
+                addr_len = take_flag_value(&args, &mut i, cmd, "--len")?
+                    .parse::<u64>()
+                    .context("无效的 --len 值")?;
+                if addr_len == 0 {
+                    bail!("--len 必须 >= 1");
+                }
+            }
+            "--seq-range" => {
+                let v = take_flag_value(&args, &mut i, cmd, "--seq-range")?;
+                let (s, e) = parse_seq_range(v)?;
+                min_seq = s;
+                max_seq = e;
+            }
+            "--min-seq" => {
+                min_seq = Some(
+                    take_flag_value(&args, &mut i, cmd, "--min-seq")?
+                        .parse()
+                        .context("无效的 --min-seq 值")?,
+                );
+            }
+            "--max-seq" => {
+                max_seq = Some(
+                    take_flag_value(&args, &mut i, cmd, "--max-seq")?
+                        .parse()
+                        .context("无效的 --max-seq 值")?,
+                );
+            }
+            "--only-writes" => {
+                only_writes = true;
+                i += 1;
+            }
+            "--only-reads" => {
+                only_reads = true;
+                i += 1;
+            }
+            "--no-hle" => {
+                include_hle = false;
+                i += 1;
             }
             "--pc" => {
                 pc_filter = Some(parse_u64_hex_or_dec(take_flag_value(
@@ -1258,6 +1572,7 @@ fn main() -> Result<()> {
     }
 
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    warn_if_missing_ext(&reader, &idx_path);
 
     let format_rel = |pc: u64| -> String {
         if base_addr != 0 && pc >= base_addr {
@@ -1314,8 +1629,33 @@ fn main() -> Result<()> {
                     "{cmd} 需要至少提供一个过滤条件：--val <hex> / --addr <hex> / --pc <hex> / --ascii <str> / --bytes <hex>"
                 );
             }
+            if only_writes && only_reads {
+                bail!("--only-writes 与 --only-reads 互斥，请只提供其中一个");
+            }
+            if let (Some(lo), Some(hi)) = (min_seq, max_seq) {
+                if lo > hi {
+                    bail!("--min-seq ({lo}) 不能大于 --max-seq ({hi})");
+                }
+            }
+            let in_seq_range = |s: usize| -> bool {
+                if let Some(lo) = min_seq {
+                    if s < lo {
+                        return false;
+                    }
+                }
+                if let Some(hi) = max_seq {
+                    if s > hi {
+                        return false;
+                    }
+                }
+                true
+            };
             if let Some(target) = val_filter {
-                let reg_hits = reader.search_value_attributed(target);
+                let reg_hits: Vec<_> = reader
+                    .search_value_attributed(target)
+                    .into_iter()
+                    .filter(|(_, rec, _)| in_seq_range(rec.seq_low32 as usize))
+                    .collect();
                 println!("# 命中寄存器写入值 0x{target:016x}: {} 条", reg_hits.len());
                 for (idx, rec, reg_id) in reg_hits.into_iter().take(limit) {
                     let pc = rec.pc;
@@ -1327,7 +1667,11 @@ fn main() -> Result<()> {
                     );
                 }
                 if ext_path.is_some() {
-                    let mem_hits = reader.search_mem_value(target);
+                    let mem_hits: Vec<_> = reader
+                        .search_mem_value(target)
+                        .into_iter()
+                        .filter(|ext| in_seq_range(ext.seq_low32 as usize))
+                        .collect();
                     if !mem_hits.is_empty() {
                         println!("# 命中内存读写值 0x{target:016x}: {} 条", mem_hits.len());
                         for ext in mem_hits.into_iter().take(limit) {
@@ -1343,7 +1687,11 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(ref ascii) = ascii_filter {
-                let hits = reader.search_mem_bytes(ascii.as_bytes());
+                let hits: Vec<_> = reader
+                    .search_mem_bytes(ascii.as_bytes())
+                    .into_iter()
+                    .filter(|h| in_seq_range(h.seq_low32 as usize))
+                    .collect();
                 println!("# 命中内存写入 ASCII \"{ascii}\": {} 条", hits.len());
                 for hit in hits.into_iter().take(limit) {
                     println!(
@@ -1357,7 +1705,11 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(ref pat) = bytes_filter {
-                let hits = reader.search_mem_bytes(pat);
+                let hits: Vec<_> = reader
+                    .search_mem_bytes(pat)
+                    .into_iter()
+                    .filter(|h| in_seq_range(h.seq_low32 as usize))
+                    .collect();
                 let hex_str: String = pat.iter().map(|b| format!("{b:02x}")).collect();
                 println!("# 命中内存写入字节序列 {hex_str}: {} 条", hits.len());
                 for hit in hits.into_iter().take(limit) {
@@ -1372,15 +1724,39 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(target_addr) = addr_filter {
-                let hits = reader.search_mem_addr(target_addr);
-                println!("# 命中访存地址 0x{target_addr:016x}: {} 条", hits.len());
-                for ext in hits.into_iter().take(limit) {
-                    let seq = ext.seq_low32;
-                    let pc = ext.pc;
+                let min_s = min_seq.map(|v| v.min(u32::MAX as usize) as u32);
+                let max_s = max_seq.map(|v| v.min(u32::MAX as usize) as u32);
+                let include_reads = !only_writes;
+                let include_writes = !only_reads;
+                let hits = reader.query_addr_history_filtered(
+                    target_addr,
+                    addr_len,
+                    min_s,
+                    max_s,
+                    include_reads,
+                    include_writes,
+                    include_hle,
+                    limit,
+                );
+                println!(
+                    "# 命中访存地址 0x{target_addr:016x} (+{addr_len}B): {} 条",
+                    hits.len()
+                );
+                for hit in hits {
+                    let src_part = if hit.src != 0 {
+                        format!(" src=0x{:016x}", hit.src)
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "seq={seq} pc=0x{pc:016x}{} {}",
-                        format_rel(pc),
-                        BinaryTracer::format_ext_record(&ext).trim()
+                        "seq={} pc=0x{:016x}{} [{}] addr=0x{:016x} size={} val=0x{:x}{src_part}",
+                        hit.seq_low32,
+                        hit.pc,
+                        format_rel(hit.pc),
+                        hit.kind,
+                        hit.addr,
+                        hit.size,
+                        hit.value,
                     );
                 }
             }
@@ -1388,6 +1764,9 @@ fn main() -> Result<()> {
                 let mut count = 0usize;
                 for idx in 0..reader.len() {
                     if let Some(rec) = reader.get(idx) {
+                        if !in_seq_range(rec.seq_low32 as usize) {
+                            continue;
+                        }
                         let pc = rec.pc;
                         if pc == target_pc {
                             if count < limit {
@@ -1457,8 +1836,23 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|c| format!("0x{c:08x}"))
                         .collect();
+                    let io_hint = if !g.input_addrs.is_empty() || !g.output_addrs.is_empty() {
+                        let ins: Vec<String> = g
+                            .input_addrs
+                            .iter()
+                            .map(|(a, l)| format!("0x{a:x}[{l}B]"))
+                            .collect();
+                        let outs: Vec<String> = g
+                            .output_addrs
+                            .iter()
+                            .map(|(a, l)| format!("0x{a:x}[{l}B]"))
+                            .collect();
+                        format!(" | in=[{}] out=[{}]", ins.join(", "), outs.join(", "))
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  {:<16} [#{:07}..#{:07}] pc=0x{:016x}{} hits={:<4} consts=[{}]",
+                        "  {:<16} [#{:07}..#{:07}] pc=0x{:016x}{} hits={:<4} consts=[{}]{io_hint}",
                         g.algorithm,
                         g.start_idx,
                         g.end_idx,

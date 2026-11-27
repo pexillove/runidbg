@@ -7,10 +7,10 @@
 `Rust + unidbg + ... = runidbg`
 
 <p>
-  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.4-FF6B2C?style=flat-square" alt="Release v0.4.4" /></a>
+  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.5-FF6B2C?style=flat-square" alt="Release v0.4.5" /></a>
   <img src="https://img.shields.io/badge/Rust-2021-E6522C?style=flat-square&logo=rust&logoColor=white" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/Target-Android%20ARM64-34D399?style=flat-square&logo=android&logoColor=white" alt="Android ARM64" />
-  <img src="https://img.shields.io/badge/Tests-126%2F126%20passing-10B981?style=flat-square" alt="Tests 126/126" />
+  <img src="https://img.shields.io/badge/Tests-135%2F135%20passing-10B981?style=flat-square" alt="Tests 135/135" />
   <img src="https://img.shields.io/badge/License-MIT-64748B?style=flat-square" alt="MIT License" />
 </p>
 
@@ -39,12 +39,12 @@
 - **Pure-Rust Zero-JVM Speed** — `77 ms` cold start (`22.6×`), `21.7 MB` single-worker RSS (`-82%` RAM), shipped as a single binary.
 - **4 Pluggable ARM64 Backends** — Switch cleanly between `Unicorn 2.1` (full Trace / Hook / GDB) and `Dynarmic JIT` / `Linux KVM` / `macOS Hypervisor` (up to `480×` compute speedup).
 - **Complete Android Native Runtime** — Full ELF dynamic linker, `110+` HLE stubs, coalescing free-list heap, JNI 1.6, in-memory APK loader, `DeviceProfile` presets, isolated dual-stream RNG & offline-safe Socket/epoll.
-- **Zero-Copy Tracer, Lightweight Taint & Slice-to-C Decompiler** — `17.03M insns/s` dual-stream `.idx/.ext` (unifying HLE events), pure-Rust byte-granular forward/backward taint slicing, **single-path symbolic lifting → algebraic / ROTR / S-Box / OLLVM MBA simplification → self-verified compilable pseudo-C & SMT-LIB2**, SIMD pattern scanning (`22.95 GB/s`), omniscient queries & dual-run diff.
+- **Zero-Copy Tracer, Lightweight Taint & Slice-to-C Decompiler** — `17.03M insns/s` dual-stream `.idx/.ext` (unifying HLE memory/entropy/clock events with missing-`.ext` warnings), pure-Rust byte-granular forward/backward taint slicing (`--from-seq` / `--stop-at-pc` / `--stop-mem` surgical cutoffs & `[ORIGIN: HLE rand()/gettimeofday()]` tagging), **single-path symbolic lifting → algebraic / ROTR / S-Box / OLLVM MBA / byte-reassembly simplification + `--fold-rodata` + `UMULH`/`SMULH` magic-division recovery → self-verified compilable pseudo-C & SMT-LIB2**, SIMD scanning (`22.95 GB/s`), omniscient queries, `mem` reconstruction & dual-run diff-taint linkage (`diff --target-addr`).
 - **Built-In `good64` Zero-Dep ARM64 Assembler & Relocator** — Covers 99% of practical Android ARM64 instructions (bitfields, LSE atomics, sysregs, PAC/BTI, scalar FP, 128-bit NEON & AES), with 4B/16B/20B Inline Hook trampolines and multi-pass PC-relative instruction relocation as a lightweight pure-Rust Keystone replacement.
-- **OLLVM & Bytecode VM Assistant** — Auto-detects dispatch loops, 4B/8B jump tables, bytecode PCs, handler distributions & relocated regfile diffs, paired with live `watchRegfile` and word decoding.
+- **OLLVM & Bytecode VM Assistant** — Auto-detects dispatch loops, 4B/8B jump tables, bytecode PCs, handler distributions & relocated regfile diffs (with `--seq-range` windowing), paired with live `watchRegfile` and word decoding.
 - **`.rtape` Time-Travel Debugging** — Sparse 4KB dirty-page checkpoints & 4-backend relay (fast boot on Hyper/Dynarmic → record on Unicorn), bit-exact JS-free replay & reverse GDB watchpoints.
 - **QuickJS Scripting & Built-In Multi-Core RPC** — Zero-config Frida-style hooks with `runidbg.d.ts`; out-of-the-box `tokio + axum` lock-free worker pool (`1,141 QPS`), hot reload, `/metrics` & embedded dark Web UI.
-- **Built-In MCP AI Reversing Loop** — Native stdio & Streamable HTTP server with **38 tools** (including `emu_asm` & `trace_decompile`), `EnvDiag` auto-patcher & lightweight DEX index for Claude / Cursor / Codex.
+- **Built-In MCP AI Reversing Loop** — Native stdio & Streamable HTTP server with **39 tools** (including `emu_asm`, `trace_decompile`, `trace_mem` & `trace_diff` taint linkage), `EnvDiag` auto-patcher & lightweight DEX index for Claude / Cursor / Codex.
 
 ---
 
@@ -69,10 +69,11 @@ rpc.exports = {
 runidbg-cli run       sign.js                                      # Run script
 runidbg-cli serve     sign.js --workers auto --allow-reload        # Start multi-core RPC server
 runidbg-cli asm       "paciasp; ubfx x0, x1, #4, #8; ret"          # Built-in good64 ARM64 assembler
-runidbg-cli taint     trace.idx --mode backward --addr 0x50006470  # Offline taint / diff / vm
-runidbg-cli decompile trace.idx --addr 0x50006470 --len 4 --smt2   # Dynamic taint slice -> verified pseudo-C
-runidbg-cli ui        session.rtape --open                         # Dark Web UI Time-Travel Cockpit
-runidbg-cli mcp       --cwd .                                      # Launch MCP server (38 tools)
+runidbg-cli taint     trace.idx --mode backward --addr 0x50006470 --from-seq 1000  # Offline taint / diff / vm
+runidbg-cli decompile trace.idx --addr 0x50006470 --len 8 --fold-rodata --smt2     # Slice -> verified pseudo-C
+runidbg-cli mem       trace.idx --addr 0x50006170 --len 576 --at 1820000           # Reconstruct memory at any seq
+runidbg-cli ui        session.rtape --open                                         # Dark Web UI Time-Travel Cockpit
+runidbg-cli mcp       --cwd .                                                      # Launch MCP server (39 tools)
 ```
 
 ---
@@ -97,14 +98,14 @@ runidbg-cli mcp       --cwd .                                      # Launch MCP 
 | Document | Covers |
 | :--- | :--- |
 | [**Full Guide (中文)**](./docs/GUIDE.md) | Backend builds & signing, QuickJS API, `good64` assembler & Inline Hook, Trace / Taint / Slice-to-C / Diff / VM, `.rtape` time-travel & GDB RSP |
-| [**AI Agent Skill**](./docs/SKILL.md) | All 38 MCP tools and autonomous reversing workflows for Claude / Cursor / Codex |
+| [**AI Agent Skill**](./docs/SKILL.md) | All 39 MCP tools and autonomous reversing workflows for Claude / Cursor / Codex |
 | [**GitHub Releases**](https://github.com/tiwe0/runidbg/releases) | Prebuilt binaries for all platforms + `SHA256SUMS.txt` |
 
 ---
 
 ## Contributing & Acknowledgements
 
-Incompatible Android ARM64 `.so` samples (with credentials redacted) and minimal reproduction scripts are warmly welcomed via Issues & PRs. Run `cargo test` to execute the full test suite (`126` tests on macOS ARM64; `125` on Linux/Windows).
+Incompatible Android ARM64 `.so` samples (with credentials redacted) and minimal reproduction scripts are warmly welcomed via Issues & PRs. Run `cargo test` to execute the full test suite (`135` tests on macOS ARM64; `134` on Linux/Windows).
 
 Special thanks to [**unidbg**](https://github.com/zhkl0228/unidbg) (`zhkl0228`) for pioneering hand-crafted Android/iOS emulation in the pre-AI era, as well as [Unicorn Engine](https://github.com/unicorn-engine/unicorn), [Dynarmic](https://github.com/merryhime/dynarmic), [QuickJS](https://bellard.org/quickjs/) / `rquickjs`, `goblin`, and `bad64`.
 

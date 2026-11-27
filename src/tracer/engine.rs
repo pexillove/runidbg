@@ -235,12 +235,22 @@ impl BinaryTracer {
         self.last_seq_low32 = seq as u32;
         self.last_pc = pc;
 
+        let level_tag = if self.stats.recorded_insns == 0 {
+            match self.level {
+                TraceLevel::Fast => 1u8,
+                TraceLevel::RegDelta => 2u8,
+                TraceLevel::Full => 3u8,
+            }
+        } else {
+            0u8
+        };
+
         self.push_idx(TraceRecord {
             pc,
             opcode,
             reg_diff_mask: 0,
             primary_reg_id: 0xFF,
-            _reserved: [0; 3],
+            _reserved: [0, level_tag, 0],
             primary_reg_val: 0,
             seq_low32: seq as u32,
         });
@@ -269,7 +279,9 @@ impl BinaryTracer {
                         primary_reg_id = i as u8;
                         primary_reg_val = cur;
                     } else {
-                        has_ext = 1;
+                        if !matches!(self.ext_sink, ExtSink::Disabled) {
+                            has_ext = 1;
+                        }
                         self.push_ext(ExtRecord {
                             seq_low32: seq32,
                             kind: ExtKind::RegDeltaExtra as u8,
@@ -288,12 +300,23 @@ impl BinaryTracer {
             self.initialized = true;
         }
 
+        // 记录首条指令的录制级别标记到 `_reserved[1]`（1=Fast, 2=RegDelta, 3=Full），用于离线检测缺失 `.ext`
+        let level_tag = if self.stats.recorded_insns == 0 {
+            match self.level {
+                TraceLevel::Fast => 1u8,
+                TraceLevel::RegDelta => 2u8,
+                TraceLevel::Full => 3u8,
+            }
+        } else {
+            0u8
+        };
+
         self.push_idx(TraceRecord {
             pc,
             opcode,
             reg_diff_mask: diff_mask,
             primary_reg_id,
-            _reserved: [has_ext, 0, 0],
+            _reserved: [has_ext, level_tag, 0],
             primary_reg_val,
             seq_low32: seq32,
         });
@@ -453,6 +476,33 @@ impl BinaryTracer {
                     value: 0,
                     pc: ev.caller_pc,
                 });
+            }
+            ExtKind::HleSource => {
+                let need_meta = ev.dst != 0 && ev.len > 255;
+                if need_meta && self.ext_remaining_capacity() < 2 {
+                    self.stats.dropped_ext += 2;
+                    return;
+                }
+                self.push_ext(ExtRecord {
+                    seq_low32: seq,
+                    kind: ExtKind::HleSource as u8,
+                    size_or_reg: ev.subop_or_byte,
+                    _pad: [ev.len.min(255) as u8, ev.aux_subop],
+                    addr: ev.dst,
+                    value: ev.src,
+                    pc: ev.caller_pc,
+                });
+                if need_meta {
+                    self.push_ext(ExtRecord {
+                        seq_low32: seq,
+                        kind: ExtKind::HleMeta as u8,
+                        size_or_reg: 0,
+                        _pad: [0; 2],
+                        addr: ev.dst,
+                        value: ev.len,
+                        pc: ev.caller_pc,
+                    });
+                }
             }
             _ => {}
         }

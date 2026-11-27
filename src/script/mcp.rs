@@ -435,6 +435,7 @@ impl McpServer {
                 Ok(json!({
                     "totalRecords": reader.len(),
                     "totalExtRecords": reader.ext_len(),
+                    "missingExtWarning": reader.missing_ext_warning(),
                     "returned": lines.len(),
                     "lines": lines,
                 }))
@@ -515,12 +516,21 @@ impl McpServer {
                             "firstPcOffset": first_off,
                             "hitCount": g.hit_count,
                             "distinctConstants": consts,
+                            "inputAddrs": g.input_addrs.iter().map(|(a, l)| json!({
+                                "addrHex": format!("0x{a:016x}"),
+                                "len": l,
+                            })).collect::<Vec<_>>(),
+                            "outputAddrs": g.output_addrs.iter().map(|(a, l)| json!({
+                                "addrHex": format!("0x{a:016x}"),
+                                "len": l,
+                            })).collect::<Vec<_>>(),
                         })
                     })
                     .collect();
                 Ok(json!({
                     "totalRecords": reader.len(),
                     "totalExtRecords": reader.ext_len(),
+                    "missingExtWarning": reader.missing_ext_warning(),
                     "hitGroupCount": groups.len(),
                     "groups": groups,
                 }))
@@ -1034,12 +1044,53 @@ impl McpServer {
                     Some(v) => Some(v as usize),
                     None => opt_u64_strict(args, "startIdx")?.map(|v| v as usize),
                 };
+                let min_idx = match opt_u64_strict(args, "fromIdx")? {
+                    Some(v) => Some(v as usize),
+                    None => opt_u64_strict(args, "minIdx")?.map(|v| v as usize),
+                };
+                let mut stop_at_pcs = Vec::new();
+                if let Some(v_pcs) = args.get("stopAtPcs").filter(|v| !v.is_null()) {
+                    let arr = v_pcs
+                        .as_array()
+                        .ok_or_else(|| anyhow!("trace_taint 参数 stopAtPcs 必须为地址数组"))?;
+                    for v in arr {
+                        stop_at_pcs.push(parse_addr_val(Some(v))?);
+                    }
+                }
+                let mut stop_mem_ranges = Vec::new();
+                if let Some(v_sm) = args.get("stopMem").filter(|v| !v.is_null()) {
+                    let arr = v_sm
+                        .as_array()
+                        .ok_or_else(|| anyhow!("trace_taint 参数 stopMem 必须为对象数组"))?;
+                    for item in arr {
+                        if !item.is_object() {
+                            return Err(anyhow!("trace_taint stopMem 元素必须为 {{ addr, len? }} 对象"));
+                        }
+                        let a = parse_addr_val(item.get("addr"))?;
+                        let l = match item.get("len").filter(|v| !v.is_null()) {
+                            Some(lv) => {
+                                let n = lv
+                                    .as_u64()
+                                    .ok_or_else(|| anyhow!("stopMem[].len 必须为正整数"))?;
+                                if n == 0 || n > 65536 {
+                                    return Err(anyhow!("stopMem[].len 必须在 1..=65536 之间，收到 {n}"));
+                                }
+                                n as usize
+                            }
+                            None => 8,
+                        };
+                        stop_mem_ranges.push((a, l));
+                    }
+                }
                 let max_insns = opt_u64_strict(args, "maxInsns")?.unwrap_or(0) as usize;
                 let max_steps = opt_u64_range(args, "maxSteps", 1, 2000)?.unwrap_or(200) as usize;
                 let track_mem_index = opt_bool_strict(args, "trackMemIndex")?.unwrap_or(true);
                 let track_sp = opt_bool_strict(args, "trackSp")?.unwrap_or(false);
                 let opts = crate::tracer::TaintOptions {
                     anchor_idx,
+                    min_idx,
+                    stop_at_pcs,
+                    stop_mem_ranges,
                     max_insns,
                     max_steps,
                     track_mem_index,
@@ -1059,8 +1110,11 @@ impl McpServer {
                     "mode": report.mode,
                     "seed": report.seed_desc,
                     "anchorIdx": report.anchor_idx,
+                    "stopIdx": report.stop_idx,
                     "scannedInsns": report.scanned_insns,
                     "totalMatchingSteps": report.total_matching_steps,
+                    "missingExtWarning": reader.missing_ext_warning(),
+                    "originAnnotations": report.origin_annotations,
                     "steps": report.steps.iter().map(|s| json!({
                         "idx": s.idx,
                         "seq": s.seq,
@@ -1094,7 +1148,8 @@ impl McpServer {
                 let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
                 let limit = opt_u64_range(args, "limit", 1, 1000)?.unwrap_or(100) as usize;
                 let min_seq = opt_u64_strict(args, "minSeq")?.map(|v| v.min(u32::MAX as u64) as u32);
-                let at_seq = opt_u64_strict(args, "at")?.map(|v| v.min(u32::MAX as u64) as u32);
+                let max_seq = opt_u64_strict(args, "maxSeq")?.map(|v| v.min(u32::MAX as u64) as u32);
+                let at_seq = max_seq.or(opt_u64_strict(args, "at")?.map(|v| v.min(u32::MAX as u64) as u32));
                 let val_opt = args.get("value").filter(|v| !v.is_null());
                 let addr_opt = args.get("addr").filter(|v| !v.is_null());
                 if val_opt.is_some() && addr_opt.is_some() {
@@ -1113,13 +1168,41 @@ impl McpServer {
                 } else if let Some(addr_v) = addr_opt {
                     let addr = parse_addr_val(Some(addr_v))?;
                     let len = opt_u64_range(args, "len", 1, u64::MAX)?.unwrap_or(1);
-                    let writes_only = opt_bool_strict(args, "writesOnly")?.unwrap_or(false);
-                    reader.query_addr_history_in_range(addr, len, min_seq, at_seq, writes_only, limit)
+                    let writes_only = opt_bool_strict(args, "writesOnly")?;
+                    let kind_str = opt_str_strict(args, "kind")?.map(str::to_ascii_lowercase);
+                    let (include_reads, include_writes) = match (kind_str.as_deref(), writes_only) {
+                        (Some("r" | "read" | "reads"), Some(true)) => {
+                            return Err(anyhow!("trace_query 参数 kind=\"r\" 与 writesOnly=true 互斥"));
+                        }
+                        (Some("r" | "read" | "reads"), _) => (true, false),
+                        (Some("w" | "write" | "writes"), _) => (false, true),
+                        (Some("rw" | "all"), Some(true)) => {
+                            return Err(anyhow!("trace_query 参数 kind=\"rw\" 与 writesOnly=true 互斥"));
+                        }
+                        (Some("rw" | "all"), _) => (true, true),
+                        (None, Some(true)) => (false, true),
+                        (None, _) => (true, true),
+                        (Some(other), _) => {
+                            return Err(anyhow!("无效的 trace_query kind `{other}`（支持 r/w/rw）"));
+                        }
+                    };
+                    let include_hle = opt_bool_strict(args, "includeHle")?.unwrap_or(true);
+                    reader.query_addr_history_filtered(
+                        addr,
+                        len,
+                        min_seq,
+                        at_seq,
+                        include_reads,
+                        include_writes,
+                        include_hle,
+                        limit,
+                    )
                 } else {
                     return Err(anyhow!("trace_query 需要提供 value 或 addr 参数"));
                 };
                 Ok(json!({
                     "count": hits.len(),
+                    "missingExtWarning": reader.missing_ext_warning(),
                     "hits": hits.iter().map(|h| json!({
                         "seq": h.seq_low32,
                         "pc": h.pc,
@@ -1148,10 +1231,50 @@ impl McpServer {
                 let limit = opt_u64_range(args, "limit", 1, 500)?.unwrap_or(64) as usize;
                 let ra = TraceReader::open(&idx_a, ext_a.as_deref())?;
                 let rb = TraceReader::open(&idx_b, ext_b.as_deref())?;
+                if let Some(taddr_v) = args.get("targetAddr").filter(|v| !v.is_null()) {
+                    let taddr = parse_addr_val(Some(taddr_v))?;
+                    let len = opt_u64_range(args, "len", 1, 4096)?.unwrap_or(16) as usize;
+                    let max_insns = opt_u64_strict(args, "maxInsns")?.unwrap_or(0) as usize;
+                    let dt = TraceReader::diff_taint_bytes(&ra, &rb, taddr, len, max_insns);
+                    let fmt_opt_bytes = |bs: &[Option<u8>]| -> String {
+                        let mut s = String::with_capacity(bs.len() * 2);
+                        for b in bs {
+                            match b {
+                                Some(v) => s.push_str(&format!("{v:02x}")),
+                                None => s.push_str("??"),
+                            }
+                        }
+                        s
+                    };
+                    return Ok(json!({
+                        "targetAddrHex": format!("0x{:016x}", dt.target_addr),
+                        "len": dt.len,
+                        "identicalBytes": dt.identical_bytes,
+                        "differingBytes": dt.differing_bytes,
+                        "missingExtWarningA": ra.missing_ext_warning(),
+                        "missingExtWarningB": rb.missing_ext_warning(),
+                        "summaryText": dt.format_summary(),
+                        "spans": dt.spans.iter().map(|sp| json!({
+                            "offset": sp.offset,
+                            "addrHex": format!("0x{:016x}", sp.addr),
+                            "len": sp.len,
+                            "bytesAHex": fmt_opt_bytes(&sp.bytes_a),
+                            "bytesBHex": fmt_opt_bytes(&sp.bytes_b),
+                            "originsARegs": sp.origins_a_regs,
+                            "originsAMem": sp.origins_a_mem.iter().map(|(a, l)| format!("0x{a:x}[{l}]")).collect::<Vec<_>>(),
+                            "originsAHle": sp.origins_a_hle,
+                            "originsBRegs": sp.origins_b_regs,
+                            "originsBMem": sp.origins_b_mem.iter().map(|(a, l)| format!("0x{a:x}[{l}]")).collect::<Vec<_>>(),
+                            "originsBHle": sp.origins_b_hle,
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
                 let summary = TraceReader::diff_traces(&ra, &rb, limit);
                 Ok(json!({
                     "totalA": summary.total_a,
                     "totalB": summary.total_b,
+                    "missingExtWarningA": ra.missing_ext_warning(),
+                    "missingExtWarningB": rb.missing_ext_warning(),
                     "commonPrefixInsns": summary.common_prefix_insns,
                     "firstControlDivergenceIdx": summary.first_control_divergence_idx,
                     "firstDataDivergenceIdx": summary.first_data_divergence_idx,
@@ -1220,6 +1343,17 @@ impl McpServer {
                 if let Some(md) = opt_u64_range(args, "minDispatches", 1, 1_000_000)? {
                     opts.min_dispatches = md as usize;
                 }
+                if let Some(mi) = opt_u64_strict(args, "minIdx")? {
+                    opts.min_idx = Some(mi as usize);
+                }
+                if let Some(mx) = opt_u64_strict(args, "maxIdx")? {
+                    opts.max_idx = Some(mx as usize);
+                }
+                if let (Some(lo), Some(hi)) = (opts.min_idx, opts.max_idx) {
+                    if lo > hi {
+                        return Err(anyhow!("trace_vm_analyze 参数 minIdx ({lo}) 不能大于 maxIdx ({hi})"));
+                    }
+                }
                 if let Some(mi) = opt_u64_strict(args, "maxInsns")? {
                     opts.max_insns = mi as usize;
                 }
@@ -1236,6 +1370,7 @@ impl McpServer {
                 Ok(json!({
                     "scannedInsns": report.scanned_insns,
                     "totalVmSteps": report.total_vm_steps,
+                    "missingExtWarning": reader.missing_ext_warning(),
                     "selectedDispatcherHex": report.selected_dispatcher.map(|p| format!("0x{p:016x}")),
                     "detectedBcReg": report.detected_bc_reg,
                     "detectedBcMemAddrHex": report.detected_bc_mem_addr.map(|a| format!("0x{a:016x}")),
@@ -1309,6 +1444,50 @@ impl McpServer {
                 if let Some(v) = opt_u64_strict(args, "atIdx")? {
                     opts.anchor_idx = Some(v as usize);
                 }
+                if let Some(v) = opt_u64_strict(args, "fromIdx")?
+                    .or(opt_u64_strict(args, "minIdx")?)
+                {
+                    opts.from_idx = Some(v as usize);
+                }
+                if let Some(v_pcs) = args.get("stopAtPcs").filter(|v| !v.is_null()) {
+                    let arr = v_pcs
+                        .as_array()
+                        .ok_or_else(|| anyhow!("trace_decompile 参数 stopAtPcs 必须为地址数组"))?;
+                    for v in arr {
+                        opts.stop_at_pcs.push(parse_addr_val(Some(v))?);
+                    }
+                }
+                if let Some(v_sm) = args.get("stopMem").filter(|v| !v.is_null()) {
+                    let arr = v_sm
+                        .as_array()
+                        .ok_or_else(|| anyhow!("trace_decompile 参数 stopMem 必须为对象数组"))?;
+                    for item in arr {
+                        if !item.is_object() {
+                            return Err(anyhow!(
+                                "trace_decompile stopMem 元素必须为 {{ addr, len? }} 对象"
+                            ));
+                        }
+                        let a = parse_addr_val(item.get("addr"))?;
+                        let l = match item.get("len").filter(|v| !v.is_null()) {
+                            Some(lv) => {
+                                let n = lv
+                                    .as_u64()
+                                    .ok_or_else(|| anyhow!("stopMem[].len 必须为正整数"))?;
+                                if n == 0 || n > 65536 {
+                                    return Err(anyhow!(
+                                        "stopMem[].len 必须在 1..=65536 之间，收到 {n}"
+                                    ));
+                                }
+                                n as usize
+                            }
+                            None => 8,
+                        };
+                        opts.stop_mem_ranges.push((a, l));
+                    }
+                }
+                if let Some(v) = opt_bool_strict(args, "foldRodata")? {
+                    opts.fold_rodata = v;
+                }
                 if let Some(v) = opt_u64_strict(args, "maxInsns")? {
                     opts.max_insns = v as usize;
                 }
@@ -1337,10 +1516,13 @@ impl McpServer {
                 Ok(json!({
                     "seed": report.seed_desc,
                     "anchorIdx": report.anchor_idx,
+                    "stopIdx": report.stop_idx,
                     "scannedInsns": report.scanned_insns,
                     "sliceInsns": report.slice_insns,
                     "rawNodes": report.raw_nodes,
                     "simplifiedNodes": report.simplified_nodes,
+                    "missingExtWarning": reader.missing_ext_warning(),
+                    "originAnnotations": report.origin_annotations,
                     "expectedOutputHex": report.expected_output.map(|v| format!("0x{v:x}")),
                     "evaluatedOutputHex": report.evaluated_output.map(|v| format!("0x{v:x}")),
                     "verified": report.verified,
@@ -1359,6 +1541,37 @@ impl McpServer {
                         "elemBytes": t.elem_bytes,
                         "observedCount": t.observed_entries.len(),
                     })).collect::<Vec<_>>(),
+                }))
+            }
+            "trace_mem" => {
+                let idx_path = PathBuf::from(req_str(args, "idxPath")?);
+                let ext_path = resolve_ext_path(&idx_path, opt_str_strict(args, "extPath")?);
+                let addr = parse_addr_val(args.get("addr"))?;
+                let len = opt_u64_range(args, "len", 1, 65536)?.unwrap_or(64) as usize;
+                let at_seq = opt_u64_strict(args, "atSeq")?
+                    .or(opt_u64_strict(args, "at")?)
+                    .map(|v| v.min(u32::MAX as u64) as u32)
+                    .unwrap_or(u32::MAX);
+                let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+                let bytes = reader.reconstruct_mem_at(addr, len, at_seq);
+                let mut hex = String::with_capacity(len * 2);
+                let mut known = 0usize;
+                for mb in &bytes {
+                    match mb {
+                        Some(b) => {
+                            known += 1;
+                            hex.push_str(&format!("{b:02x}"));
+                        }
+                        None => hex.push_str("??"),
+                    }
+                }
+                Ok(json!({
+                    "addrHex": format!("0x{addr:016x}"),
+                    "len": len,
+                    "atSeq": at_seq,
+                    "knownBytes": known,
+                    "hex": hex,
+                    "missingExtWarning": reader.missing_ext_warning(),
                 }))
             }
             "emu_asm" => {
@@ -1983,6 +2196,9 @@ fn tool_definitions() -> Value {
                     "reg": { "type": "string", "description": "Seed/target register name (e.g. 'x0', 'w8', 'v0', 'q1')" },
                     "atIdx": { "type": "integer", "minimum": 0, "description": "Anchor instruction index (start for forward, observation point for backward)" },
                     "startIdx": { "type": "integer", "minimum": 0, "description": "Alias of atIdx for forward mode" },
+                    "fromIdx": { "type": "integer", "minimum": 0, "description": "Optional backward slice lower bound index (inclusive)" },
+                    "stopAtPcs": { "type": "array", "items": {}, "description": "Optional PC list where backward slicing stops and promotes boundary state to origins" },
+                    "stopMem": { "type": "array", "items": { "type": "object", "required": ["addr"], "properties": { "addr": {}, "len": { "type": "integer", "minimum": 1, "maximum": 65536 } } }, "description": "Optional memory ranges [{addr, len}] pinned as origins when read during backward slicing" },
                     "maxInsns": { "type": "integer", "minimum": 0, "description": "Optional max instructions to scan (0 = all)" },
                     "maxSteps": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max propagation steps returned (default 200)" },
                     "trackMemIndex": { "type": "boolean", "description": "Track indexed load register dependencies such as S-Box lookups (default true)" },
@@ -2005,15 +2221,18 @@ fn tool_definitions() -> Value {
                     "addr": { "description": "Find read/write/HLE history touching [addr, addr+len)" },
                     "len": { "type": "integer", "minimum": 1, "description": "Byte length for addr query (default 1)" },
                     "minSeq": { "type": "integer", "minimum": 0, "description": "Optional lower seq bound" },
-                    "at": { "type": "integer", "minimum": 0, "description": "Upper seq bound" },
+                    "maxSeq": { "type": "integer", "minimum": 0, "description": "Optional upper seq bound" },
+                    "at": { "type": "integer", "minimum": 0, "description": "Upper seq bound (alias of maxSeq)" },
                     "writesOnly": { "type": "boolean", "description": "For addr query, return only writes & HLE mutations" },
+                    "kind": { "type": "string", "enum": ["r", "w", "rw"], "description": "For addr query, filter by reads ('r'), writes ('w'), or both ('rw')" },
+                    "includeHle": { "type": "boolean", "description": "For addr query, include HLE events (default true)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Max hits returned (default 100)" }
                 }
             }
         },
         {
             "name": "trace_diff",
-            "description": "Differential comparison between two offline traces (a.idx vs b.idx), reporting common prefix length, first control-flow divergence, and first register/memory/HLE data divergence.",
+            "description": "Differential comparison between two offline traces (a.idx vs b.idx), reporting common prefix length, first control-flow/data divergence, or (when targetAddr is set) per-byte buffer diff with automatic backward taint linkage.",
             "inputSchema": {
                 "type": "object",
                 "required": ["idxPathA", "idxPathB"],
@@ -2022,7 +2241,10 @@ fn tool_definitions() -> Value {
                     "idxPathB": { "type": "string" },
                     "extPathA": { "type": "string" },
                     "extPathB": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max diff entries returned (default 64)" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max diff entries returned (default 64)" },
+                    "targetAddr": { "description": "Optional buffer address for dual-run diff + automatic backward taint linkage" },
+                    "len": { "type": "integer", "minimum": 1, "maximum": 4096, "description": "Buffer length when targetAddr is set (default 16)" },
+                    "maxInsns": { "type": "integer", "minimum": 0, "description": "Optional max instructions for backward taint linkage (0 = all)" }
                 }
             }
         },
@@ -2045,6 +2267,8 @@ fn tool_definitions() -> Value {
                     "layout": { "type": "string", "description": "Optional instruction-word bitfield spec '<op_lsb>:<op_width>[,<f0_lsb>[:<f0_width>],...]', e.g. '6:6,12:5,17:5,22:5,27:5'" },
                     "minHandlers": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Min unique handler targets for dispatcher detection (default 3)" },
                     "minDispatches": { "type": "integer", "minimum": 1, "maximum": 1000000, "description": "Min dispatch hits for dispatcher detection (default 4)" },
+                    "minIdx": { "type": "integer", "minimum": 0, "description": "Optional lower instruction index bound (inclusive)" },
+                    "maxIdx": { "type": "integer", "minimum": 0, "description": "Optional upper instruction index bound (inclusive)" },
                     "maxInsns": { "type": "integer", "minimum": 0, "description": "Max native instructions to scan (0 = all)" },
                     "maxSteps": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max VM steps returned in report (default 200)" },
                     "baseAddr": { "description": "Optional module base address for +0x... offsets in summaryText" }
@@ -2064,6 +2288,10 @@ fn tool_definitions() -> Value {
                     "len": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Output memory width in bytes (default 4)" },
                     "reg": { "type": "string", "description": "Target output register (e.g. 'x0', 'w0'; mutually exclusive with addr)" },
                     "atIdx": { "type": "integer", "minimum": 0, "description": "Observation instruction index (default last instruction)" },
+                    "fromIdx": { "type": "integer", "minimum": 0, "description": "Optional slice lower bound index (inclusive) to isolate a single loop round or phase" },
+                    "stopAtPcs": { "type": "array", "items": {}, "description": "Optional PC list where slicing stops and promotes boundary state to symbolic inputs" },
+                    "stopMem": { "type": "array", "items": { "type": "object", "required": ["addr"], "properties": { "addr": {}, "len": { "type": "integer", "minimum": 1, "maximum": 65536 } } }, "description": "Optional memory ranges [{addr, len}] pinned as symbolic inputs when read" },
+                    "foldRodata": { "type": "boolean", "description": "Fold memory never written in the trace (e.g. .rodata / VM bytecode) into constants (default false)" },
                     "maxInsns": { "type": "integer", "minimum": 0, "description": "Max instructions to scan backward (0 = all)" },
                     "maxSteps": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Max taint slice steps (default 4096)" },
                     "functionName": { "type": "string", "description": "Generated C function name (default 'decompiled_slice')" },
@@ -2071,6 +2299,22 @@ fn tool_definitions() -> Value {
                     "emitSmt2": { "type": "boolean", "description": "Also emit standard QF_BV SMT-LIB2 for external Z3/Bitwuzla inversion (default false)" },
                     "trackMemIndex": { "type": "boolean", "description": "Track indexed table/S-Box lookups (default true)" },
                     "trackSp": { "type": "boolean", "description": "Track SP arithmetic (default false)" }
+                }
+            }
+        },
+        {
+            "name": "trace_mem",
+            "description": "Reconstruct a memory buffer [addr, addr+len) at a specific sequence number (or trace end) from offline trace.idx + trace.ext write & HLE history.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath", "addr"],
+                "properties": {
+                    "idxPath": { "type": "string", "description": "Path to trace.idx file" },
+                    "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling exists)" },
+                    "addr": { "description": "Start memory address (integer or '0x...' hex string)" },
+                    "len": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Byte length to reconstruct (default 64, max 65536)" },
+                    "atSeq": { "type": "integer", "minimum": 0, "description": "Optional upper sequence number (default end of trace)" },
+                    "at": { "type": "integer", "minimum": 0, "description": "Alias of atSeq" }
                 }
             }
         },

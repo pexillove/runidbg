@@ -167,6 +167,10 @@ pub struct VmAnalysisOptions {
     pub min_handlers: usize,
     /// 识别调度点所需最少执行次数（默认 4）
     pub min_dispatches: usize,
+    /// 可选：起始指令下标（含；等价 `--seq-range <start>..<end>`）
+    pub min_idx: Option<usize>,
+    /// 可选：结束指令下标（含；等价 `--seq-range <start>..<end>`）
+    pub max_idx: Option<usize>,
     /// 最多扫描的原生指令条数（0 = 全部）
     pub max_insns: usize,
     /// 报告中最多保留的详细 VM 步数（0 = 全部，默认 256）
@@ -184,6 +188,8 @@ impl Default for VmAnalysisOptions {
             layout: None,
             min_handlers: 3,
             min_dispatches: 4,
+            min_idx: None,
+            max_idx: None,
             max_insns: 0,
             max_steps: 256,
         }
@@ -714,11 +720,16 @@ impl TraceReader {
     /// 离线执行 VM 专项分析（自动识别调度循环、跳转表、Handler 分布、字节码步长与虚拟寄存器堆差分）
     pub fn analyze_vm(&self, opts: &VmAnalysisOptions) -> VmAnalysisReport {
         let total = self.len();
-        let scan_len = if opts.max_insns > 0 {
-            total.min(opts.max_insns)
-        } else {
-            total
-        };
+        let scan_start = opts.min_idx.unwrap_or(0).min(total);
+        let mut scan_end = opts
+            .max_idx
+            .map(|m| m.saturating_add(1).min(total))
+            .unwrap_or(total);
+        if opts.max_insns > 0 {
+            scan_end = scan_end.min(scan_start.saturating_add(opts.max_insns));
+        }
+        let scan_len = scan_end;
+        let window_insns = scan_end.saturating_sub(scan_start);
         let safe_bc_reg = opts.bc_reg.filter(|&r| r < 32);
         let safe_regfile = opts
             .regfile
@@ -730,9 +741,9 @@ impl TraceReader {
                 c
             });
 
-        if scan_len < 2 {
+        if window_insns < 2 {
             return VmAnalysisReport {
-                scanned_insns: scan_len,
+                scanned_insns: window_insns,
                 dispatchers: Vec::new(),
                 selected_dispatcher: opts.dispatcher_pc,
                 detected_bc_reg: safe_bc_reg.map(format_reg_slot),
@@ -743,7 +754,7 @@ impl TraceReader {
             };
         }
 
-        // ── Phase 1: 单遍扫描所有间接分支 BR / BLR，按分数初筛 Top-8 候选再做深度探测（避免 O(C*N) 退化） ──
+        // ── Phase 1: 单遍扫描窗口内所有间接分支 BR / BLR，按分数初筛 Top-8 候选再做深度探测 ──
         struct RawDisp {
             kind: &'static str,
             target_reg: u8,
@@ -751,7 +762,7 @@ impl TraceReader {
             targets: BTreeSet<u64>,
         }
         let mut raw_disps: HashMap<u64, RawDisp> = HashMap::new();
-        for idx in 0..scan_len.saturating_sub(1) {
+        for idx in scan_start..scan_end.saturating_sub(1) {
             let Some(rec) = self.get(idx) else { continue };
             let Some((kind, rn)) = decode_indirect_branch(rec.opcode) else {
                 continue;
@@ -835,7 +846,7 @@ impl TraceReader {
 
         let Some(disp_pc) = selected_pc else {
             return VmAnalysisReport {
-                scanned_insns: scan_len,
+                scanned_insns: window_insns,
                 dispatchers: candidates,
                 selected_dispatcher: None,
                 detected_bc_reg: safe_bc_reg.map(format_reg_slot),
@@ -851,7 +862,7 @@ impl TraceReader {
             rd.hit_indices.clone()
         } else {
             let mut v = Vec::new();
-            for idx in 0..scan_len.saturating_sub(1) {
+            for idx in scan_start..scan_end.saturating_sub(1) {
                 if let (Some(rec), Some(next)) = (self.get(idx), self.get(idx + 1)) {
                     if rec.pc == disp_pc && next.seq_low32 == rec.seq_low32.wrapping_add(1) {
                         v.push(idx);
@@ -863,7 +874,7 @@ impl TraceReader {
 
         if hit_indices.is_empty() {
             return VmAnalysisReport {
-                scanned_insns: scan_len,
+                scanned_insns: window_insns,
                 dispatchers: candidates,
                 selected_dispatcher: Some(disp_pc),
                 detected_bc_reg: safe_bc_reg.map(format_reg_slot),
@@ -1290,7 +1301,7 @@ impl TraceReader {
         });
 
         VmAnalysisReport {
-            scanned_insns: scan_len,
+            scanned_insns: window_insns,
             dispatchers: candidates,
             selected_dispatcher: Some(disp_pc),
             detected_bc_reg: active_bc_reg.map(format_reg_slot),

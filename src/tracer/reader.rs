@@ -83,7 +83,7 @@ impl CallTreeNode {
     }
 }
 
-/// 密码学常量扫描归并后的算法调用窗口
+/// 密码学常量/结构扫描归并后的算法调用窗口（附候选输入/输出缓冲地址）
 #[derive(Debug, Clone)]
 pub struct CryptoHitGroup {
     pub algorithm: &'static str,
@@ -92,6 +92,94 @@ pub struct CryptoHitGroup {
     pub first_pc: u64,
     pub hit_count: usize,
     pub distinct_constants: Vec<u32>,
+    /// 该算法窗口内推断的候选输入内存区间 `(addr, len)`（窗口内先读后写/只读缓冲）
+    pub input_addrs: Vec<(u64, usize)>,
+    /// 该算法窗口内推断的候选输出内存区间 `(addr, len)`（窗口内写入缓冲）
+    pub output_addrs: Vec<(u64, usize)>,
+}
+
+/// 双跑差分 + 自动反向污点联动：单个差异字节段在 A/B 两侧的溯源对比
+#[derive(Debug, Clone)]
+pub struct DiffTaintByteSpan {
+    pub offset: usize,
+    pub addr: u64,
+    pub len: usize,
+    pub bytes_a: Vec<Option<u8>>,
+    pub bytes_b: Vec<Option<u8>>,
+    pub origins_a_regs: Vec<String>,
+    pub origins_a_mem: Vec<(u64, usize)>,
+    pub origins_a_hle: Vec<String>,
+    pub origins_b_regs: Vec<String>,
+    pub origins_b_mem: Vec<(u64, usize)>,
+    pub origins_b_hle: Vec<String>,
+}
+
+/// 双跑差分 + 污点联动完整报告
+#[derive(Debug, Clone)]
+pub struct DiffTaintReport {
+    pub target_addr: u64,
+    pub len: usize,
+    pub identical_bytes: usize,
+    pub differing_bytes: usize,
+    pub spans: Vec<DiffTaintByteSpan>,
+}
+
+impl DiffTaintReport {
+    pub fn format_summary(&self) -> String {
+        let mut out = format!(
+            "# 双跑差分污点联动 | 目标: 0x{:016x}+{}B | 相同字节={} | 差异字节={} | 差异段={}\n",
+            self.target_addr,
+            self.len,
+            self.identical_bytes,
+            self.differing_bytes,
+            self.spans.len()
+        );
+        for (i, sp) in self.spans.iter().enumerate() {
+            let fmt_hex = |bs: &[Option<u8>]| -> String {
+                bs.iter()
+                    .map(|b| b.map(|v| format!("{v:02x}")).unwrap_or_else(|| "??".to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let fmt_mem = |ms: &[(u64, usize)]| -> String {
+                ms.iter()
+                    .take(6)
+                    .map(|(a, l)| format!("0x{a:x}+{l}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            out.push_str(&format!(
+                "  [Span #{i}] +0x{:x} (0x{:016x}, {}B): A=[{}] vs B=[{}]\n",
+                sp.offset,
+                sp.addr,
+                sp.len,
+                fmt_hex(&sp.bytes_a),
+                fmt_hex(&sp.bytes_b)
+            ));
+            if !sp.origins_a_regs.is_empty() || !sp.origins_b_regs.is_empty() {
+                out.push_str(&format!(
+                    "      Regs : A=[{}] | B=[{}]\n",
+                    sp.origins_a_regs.join(", "),
+                    sp.origins_b_regs.join(", ")
+                ));
+            }
+            if !sp.origins_a_mem.is_empty() || !sp.origins_b_mem.is_empty() {
+                out.push_str(&format!(
+                    "      Mem  : A=[{}] | B=[{}]\n",
+                    fmt_mem(&sp.origins_a_mem),
+                    fmt_mem(&sp.origins_b_mem)
+                ));
+            }
+            if !sp.origins_a_hle.is_empty() || !sp.origins_b_hle.is_empty() {
+                out.push_str(&format!(
+                    "      HLE  : A=[{}] | B=[{}]\n",
+                    sp.origins_a_hle.join("; "),
+                    sp.origins_b_hle.join("; ")
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// 离线零拷贝 Trace 读取器（供 `runidbg-cli` 与离线分析脚本使用）
@@ -101,6 +189,8 @@ pub struct TraceReader {
     ext_mmap: Option<Mmap>,
     ext_count: usize,
     ext_monotonic: bool,
+    recorded_level_tag: u8,
+    missing_ext: bool,
 }
 
 impl TraceReader {
@@ -146,13 +236,41 @@ impl TraceReader {
             (None, 0, true)
         };
 
+        let recorded_level_tag = if idx_count > 0 {
+            read_packed::<TraceRecord>(&idx_mmap, 0)._reserved[1]
+        } else {
+            0
+        };
+        let has_any_ext_flag = ext_mmap.is_none()
+            && matches!(recorded_level_tag, 0 | 3)
+            && (0..idx_count.min(4096))
+                .any(|i| (read_packed::<TraceRecord>(&idx_mmap, i)._reserved[0] & 1) != 0);
+        let missing_ext = ext_mmap.is_none() && (recorded_level_tag == 3 || has_any_ext_flag);
+
         Ok(Self {
             idx_mmap,
             idx_count,
             ext_mmap,
             ext_count,
             ext_monotonic,
+            recorded_level_tag,
+            missing_ext,
         })
+    }
+
+    /// 若 `.idx` 录制于 `Full` 级别（或带扩展流标记）但未加载到伴生 `.ext` 文件，返回 `true`
+    pub const fn missing_ext_warning(&self) -> bool {
+        self.missing_ext
+    }
+
+    /// 返回 `.idx` 首条记录写入的录制级别名称（兼容旧版 `.idx` 时返回 `None`）
+    pub const fn recorded_level_name(&self) -> Option<&'static str> {
+        match self.recorded_level_tag {
+            1 => Some("fast"),
+            2 => Some("reg_delta"),
+            3 => Some("full"),
+            _ => None,
+        }
     }
 
     pub const fn len(&self) -> usize {
@@ -340,6 +458,34 @@ impl TraceReader {
                         pc,
                     });
                 }
+                Some(ExtKind::HleSource) => {
+                    let op = match sr {
+                        0 => "rand",
+                        1 => "arc4random",
+                        2 => "lrand48",
+                        3 => "time",
+                        4 => "getrandom",
+                        5 => "gettimeofday",
+                        6 => "clock_gettime",
+                        _ => "hle_source",
+                    };
+                    let mut hlen = u64::from(rec._pad[0]);
+                    if i + 1 < recs.len()
+                        && recs[i + 1].kind == ExtKind::HleMeta as u8
+                        && is_matching_hle_meta(rec, recs[i + 1])
+                    {
+                        hlen = recs[i + 1].value;
+                        i += 1;
+                    }
+                    out.push(HleTraceEvent {
+                        seq_low32: seq,
+                        op,
+                        dst: addr,
+                        src: val,
+                        len: hlen,
+                        pc,
+                    });
+                }
                 _ => {}
             }
             i += 1;
@@ -363,6 +509,7 @@ impl TraceReader {
                         | ExtKind::HleMalloc
                         | ExtKind::HleFree
                         | ExtKind::HleMeta
+                        | ExtKind::HleSource
                 )
             ) {
                 raw.push(rec);
@@ -812,6 +959,31 @@ impl TraceReader {
         writes_only: bool,
         limit: usize,
     ) -> Vec<TraceQueryHit> {
+        self.query_addr_history_filtered(
+            addr,
+            len,
+            min_seq,
+            max_seq,
+            !writes_only,
+            true,
+            true,
+            limit,
+        )
+    }
+
+    /// Omniscient 地址历史精细查询（支持 `min_seq`..=`max_seq`、读/写独立过滤与 `--no-hle` 开关）
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_addr_history_filtered(
+        &self,
+        addr: u64,
+        len: u64,
+        min_seq: Option<u32>,
+        max_seq: Option<u32>,
+        include_reads: bool,
+        include_writes: bool,
+        include_hle: bool,
+        limit: usize,
+    ) -> Vec<TraceQueryHit> {
         let Some(mmap) = self.ext_mmap.as_ref() else {
             return Vec::new();
         };
@@ -826,7 +998,7 @@ impl TraceReader {
             let seq = rec.seq_low32;
             let seq_ok = min_seq.is_none_or(|lo| seq >= lo);
             match ExtKind::from_u8(rec.kind) {
-                Some(ExtKind::MemWrite) if seq_ok => {
+                Some(ExtKind::MemWrite) if seq_ok && include_writes => {
                     let sz = (rec.size_or_reg as u64).max(1);
                     if range_overlaps_u128(rec.addr, sz, addr, q_len) {
                         out.push(TraceQueryHit {
@@ -840,7 +1012,7 @@ impl TraceReader {
                         });
                     }
                 }
-                Some(ExtKind::MemRead) if seq_ok && !writes_only => {
+                Some(ExtKind::MemRead) if seq_ok && include_reads => {
                     let sz = (rec.size_or_reg as u64).max(1);
                     if range_overlaps_u128(rec.addr, sz, addr, q_len) {
                         out.push(TraceQueryHit {
@@ -865,9 +1037,11 @@ impl TraceReader {
                             i += 1;
                         }
                     }
-                    if seq_ok {
-                        let dst_hit = hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len);
-                        let src_hit = !writes_only
+                    if seq_ok && include_hle {
+                        let dst_hit = include_writes
+                            && hlen > 0
+                            && range_overlaps_u128(dst, hlen, addr, q_len);
+                        let src_hit = include_reads
                             && hlen > 0
                             && range_overlaps_u128(src, hlen, addr, q_len);
                         if dst_hit || src_hit {
@@ -888,7 +1062,7 @@ impl TraceReader {
                         }
                     }
                 }
-                Some(ExtKind::HleMemset) if seq_ok => {
+                Some(ExtKind::HleMemset) if seq_ok && include_hle && include_writes => {
                     let dst = rec.addr;
                     let hlen = rec.value;
                     if hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len) {
@@ -904,6 +1078,35 @@ impl TraceReader {
                             size: hlen,
                             kind,
                             value: rec.size_or_reg as u64,
+                            src: 0,
+                        });
+                    }
+                }
+                Some(ExtKind::HleSource) if seq_ok && include_hle && include_writes => {
+                    let dst = rec.addr;
+                    let mut hlen = u64::from(rec._pad[0]);
+                    if i + 1 < end_idx {
+                        let next = read_packed::<ExtRecord>(mmap, i + 1);
+                        if next.kind == ExtKind::HleMeta as u8 && is_matching_hle_meta(rec, next) {
+                            hlen = next.value;
+                            i += 1;
+                        }
+                    }
+                    if dst != 0 && hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len) {
+                        let kind = match rec.size_or_reg {
+                            3 => "hle_time",
+                            4 => "hle_getrandom",
+                            5 => "hle_gettimeofday",
+                            6 => "hle_clock_gettime",
+                            _ => "hle_source",
+                        };
+                        out.push(TraceQueryHit {
+                            seq_low32: seq,
+                            pc: rec.pc,
+                            addr: dst,
+                            size: hlen,
+                            kind,
+                            value: rec.value,
                             src: 0,
                         });
                     }
@@ -977,8 +1180,33 @@ impl TraceReader {
                         }
                     }
                 }
+                Some(ExtKind::HleSource) => {
+                    let dst = rec.addr;
+                    let hlen = u64::from(rec._pad[0]);
+                    if dst != 0 && hlen > 0 {
+                        let d_start = dst as u128;
+                        let d_end = d_start + hlen as u128;
+                        let first8 = rec.value.to_le_bytes();
+                        for (slot, slot_addr) in cur_addr.iter_mut().enumerate() {
+                            if let Some(a) = *slot_addr {
+                                let a128 = a as u128;
+                                if a128 >= d_start && a128 < d_end {
+                                    let off = (a128 - d_start) as usize;
+                                    if off < 8 {
+                                        out[slot] = Some(first8[off]);
+                                    } else {
+                                        // 8..hlen 的精确字节未内联于 HleSource，置为 None 防止穿透到更早的 memset 脏值
+                                        out[slot] = None;
+                                    }
+                                    *slot_addr = None;
+                                    remaining -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 Some(ExtKind::HleMeta) => {
-                    // 逆向扫描遇到 HleMeta 时与前一条 HleMemcpy 精确配对
+                    // 逆向扫描遇到 HleMeta 时与前一条 HleMemcpy 或 HleSource 精确配对
                     if i > 0 {
                         let prev = read_packed::<ExtRecord>(mmap, i - 1);
                         if prev.kind == ExtKind::HleMemcpy as u8
@@ -999,6 +1227,28 @@ impl TraceReader {
                                             if slot_addr.is_none() {
                                                 remaining -= 1;
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if prev.kind == ExtKind::HleSource as u8
+                            && is_matching_hle_meta(prev, rec)
+                        {
+                            i -= 1;
+                            let dst = prev.addr;
+                            let hlen = rec.value;
+                            if dst != 0 && hlen > 0 {
+                                let d_start = dst as u128;
+                                let d_end = d_start + hlen as u128;
+                                let first8 = prev.value.to_le_bytes();
+                                for (slot, slot_addr) in cur_addr.iter_mut().enumerate() {
+                                    if let Some(a) = *slot_addr {
+                                        let a128 = a as u128;
+                                        if a128 >= d_start && a128 < d_end {
+                                            let off = (a128 - d_start) as usize;
+                                            out[slot] = if off < 8 { Some(first8[off]) } else { None };
+                                            *slot_addr = None;
+                                            remaining -= 1;
                                         }
                                     }
                                 }
@@ -1184,6 +1434,87 @@ impl TraceReader {
         }
     }
 
+    /// 双跑差分 + 自动反向污点联动：比较 A/B 两次 Trace 在 `[target_addr, target_addr + len)` 上的最终字节差异，
+    /// 并对每个连续差异段在 A/B 两侧自动执行反向污点切片，直接定位导致每个协议字段不同的起源输入！
+    pub fn diff_taint_bytes(
+        a: &TraceReader,
+        b: &TraceReader,
+        target_addr: u64,
+        len: usize,
+        max_insns: usize,
+    ) -> DiffTaintReport {
+        use crate::tracer::taint::{TaintOptions, TaintSeed};
+
+        let capped_len = len.min(4096);
+        let bytes_a = a.reconstruct_mem_at(target_addr, capped_len, u32::MAX);
+        let bytes_b = b.reconstruct_mem_at(target_addr, capped_len, u32::MAX);
+
+        let mut identical = 0usize;
+        let mut differing = 0usize;
+        let mut spans: Vec<DiffTaintByteSpan> = Vec::new();
+        const MAX_TAINT_SPANS: usize = 64;
+        let mut i = 0usize;
+        while i < capped_len {
+            if bytes_a[i] == bytes_b[i] {
+                if bytes_a[i].is_some() {
+                    identical += 1;
+                }
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < capped_len && bytes_a[i] != bytes_b[i] {
+                differing += 1;
+                i += 1;
+            }
+            if spans.len() >= MAX_TAINT_SPANS {
+                continue;
+            }
+            let span_len = i - start;
+            let span_addr = target_addr.wrapping_add(start as u64);
+            let seed = TaintSeed::Mem {
+                addr: span_addr,
+                len: span_len,
+            };
+            let opts = TaintOptions {
+                max_insns,
+                max_steps: 256,
+                ..Default::default()
+            };
+            let rep_a = a.taint_backward(&seed, &opts);
+            let rep_b = b.taint_backward(&seed, &opts);
+            spans.push(DiffTaintByteSpan {
+                offset: start,
+                addr: span_addr,
+                len: span_len,
+                bytes_a: bytes_a[start..i].to_vec(),
+                bytes_b: bytes_b[start..i].to_vec(),
+                origins_a_regs: rep_a.tainted_regs.into_iter().map(|(n, _)| n).collect(),
+                origins_a_mem: rep_a
+                    .tainted_mem_ranges
+                    .into_iter()
+                    .map(|(ad, l, _)| (ad, l))
+                    .collect(),
+                origins_a_hle: rep_a.origin_annotations,
+                origins_b_regs: rep_b.tainted_regs.into_iter().map(|(n, _)| n).collect(),
+                origins_b_mem: rep_b
+                    .tainted_mem_ranges
+                    .into_iter()
+                    .map(|(ad, l, _)| (ad, l))
+                    .collect(),
+                origins_b_hle: rep_b.origin_annotations,
+            });
+        }
+
+        DiffTaintReport {
+            target_addr,
+            len: capped_len,
+            identical_bytes: identical,
+            differing_bytes: differing,
+            spans,
+        }
+    }
+
     /// 构建基于 `BL` / `BLR` / `RET` 的时间轴调用树（自动忽略未落入 Trace 过滤范围的外部调用）
     pub fn build_calltree(&self) -> Vec<CallTreeNode> {
         struct ActiveFrame {
@@ -1290,11 +1621,20 @@ impl TraceReader {
             ("SM4", 0x56aa_3350),
             ("SM4", 0x677d_9197),
             ("SM4", 0xb270_22dc),
-            // AES S-box / T-table words
+            // AES S-box / T-table / Rcon words
             ("AES", 0x637c_777b),
             ("AES", 0x7b77_7c63),
             ("AES", 0xc663_63a5),
             ("AES", 0xa563_63c6),
+            ("AES", 0xf87c_7c84),
+            ("AES", 0xee77_7799),
+            ("AES", 0xf67b_7b8d),
+            // Simon-128/256 z-sequence & key schedule constants
+            ("Simon", 0xffff_fffc),
+            ("Simon", 0x3369_f885),
+            ("Simon", 0x192c_0ef5),
+            ("Simon", 0x3dc9_4c3a),
+            ("Simon", 0x046d_678b),
             // ChaCha20 / Salsa20 "expand 32-byte k"
             ("ChaCha20/Salsa20", 0x6170_7865),
             ("ChaCha20/Salsa20", 0x3320_646e),
@@ -1306,15 +1646,27 @@ impl TraceReader {
             // TEA / XTEA / XXTEA
             ("TEA/XTEA", 0x9e37_79b9),
             ("TEA/XTEA", 0x61c8_8647),
+            ("TEA/XTEA", 0xc6ef_3720),
             // MurmurHash3
             ("MurmurHash3", 0xcc9e_2d51),
             ("MurmurHash3", 0x1b87_3593),
             ("MurmurHash3", 0x85eb_ca6b),
         ];
+        const SIGNATURES_64: &[(&str, u64)] = &[
+            // 仅保留高熵 64-bit z 序列 / AES S-Box 常量（避免 -4i64 即 0xfffffffffffffffc 在普通代码中误报）
+            ("Simon-128", 0x3369_f885_192c_0ef5),
+            ("Simon-128", 0x3dc9_4c3a_046d_678b),
+            ("AES", 0x76ab_d7fe_2b67_0130),
+            ("AES", 0xc56f_6bf2_7b77_7c63),
+        ];
 
         let mut const_map: HashMap<u32, Vec<&'static str>> = HashMap::new();
         for &(algo, val) in SIGNATURES {
             const_map.entry(val).or_default().push(algo);
+        }
+        let mut const_map64: HashMap<u64, Vec<&'static str>> = HashMap::new();
+        for &(algo, val) in SIGNATURES_64 {
+            const_map64.entry(val).or_default().push(algo);
         }
 
         // algo -> Vec<(idx, pc, constant)>
@@ -1322,9 +1674,31 @@ impl TraceReader {
 
         for i in 0..self.idx_count {
             let rec = read_packed::<TraceRecord>(&self.idx_mmap, i);
+            let op = rec.opcode;
+            // 检测 ARMv8 硬件 AES 指令（AESE / AESD / AESMC / AESIMC）
+            if matches!(
+                op & 0xFFFF_FC00,
+                0x4E28_4800 | 0x4E28_5800 | 0x4E28_6800 | 0x4E28_7800
+            ) {
+                let pc = rec.pc;
+                raw_hits
+                    .entry("AES (ARMv8-CE)")
+                    .or_default()
+                    .push((i, pc, op & 0xFFFF_FC00));
+            }
             let reg_id = rec.primary_reg_id;
             if reg_id != 0xFF {
                 let val = rec.primary_reg_val;
+                if let Some(algos) = const_map64.get(&val) {
+                    let (attr_idx, attr_rec) = self.attribute_pre_exec(i, rec);
+                    let pc = attr_rec.pc;
+                    for &algo in algos {
+                        raw_hits
+                            .entry(algo)
+                            .or_default()
+                            .push((attr_idx, pc, val as u32));
+                    }
+                }
                 if val <= u32::MAX as u64 {
                     let v32 = val as u32;
                     if let Some(algos) = const_map.get(&v32) {
@@ -1338,11 +1712,72 @@ impl TraceReader {
             }
         }
 
+        let mut direct_groups: Vec<CryptoHitGroup> = Vec::new();
         if let Some(mmap) = self.ext_mmap.as_ref() {
+            const AES_SBOX_HEAD: [u8; 16] = [
+                0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe,
+                0xd7, 0xab, 0x76,
+            ];
             let mut seq_to_idx: Option<HashMap<u32, usize>> = None;
+            // 检测软件 AES S-Box 字节查表（任意对齐：按首 16 字节唯一值反推候选表基址 addr - off，命中 >= 6 个不同偏移）
+            // 与 RC4 256B 状态写（延迟查 seq_to_idx 避免大 trace 无谓建表，且统计独立字节偏移数防止误报）
+            let mut aes_sbox_hits: HashMap<u64, (u16, u32, u64)> = HashMap::new();
+            let mut rc4_page_writes: HashMap<u64, ([u64; 4], u32, u32, u64, usize)> =
+                HashMap::new();
+
             for i in 0..self.ext_count {
                 let ext = read_packed::<ExtRecord>(mmap, i);
                 let val = ext.value;
+                if let Some(algos) = const_map64.get(&val) {
+                    let seq = ext.seq_low32;
+                    let map = seq_to_idx.get_or_insert_with(|| self.build_seq_index_map());
+                    if let Some(&idx) = map.get(&seq) {
+                        let (attr_idx, pc) = if ext.kind == ExtKind::RegDeltaExtra as u8 {
+                            if let Some(raw_rec) = self.get(idx) {
+                                let (ai, ar) = self.attribute_pre_exec(idx, raw_rec);
+                                (ai, ar.pc)
+                            } else {
+                                (idx, ext.pc)
+                            }
+                        } else {
+                            (idx, ext.pc)
+                        };
+                        for &algo in algos {
+                            raw_hits
+                                .entry(algo)
+                                .or_default()
+                                .push((attr_idx, pc, val as u32));
+                        }
+                    }
+                }
+                if ext.kind == ExtKind::MemRead as u8 && ext.size_or_reg == 1 {
+                    let b = (val & 0xFF) as u8;
+                    if let Some(off) = AES_SBOX_HEAD.iter().position(|&x| x == b) {
+                        let base = ext.addr.wrapping_sub(off as u64);
+                        let ent = aes_sbox_hits
+                            .entry(base)
+                            .or_insert((0u16, ext.seq_low32, ext.pc));
+                        ent.0 |= 1u16 << off;
+                    }
+                } else if ext.kind == ExtKind::MemWrite as u8 && ext.size_or_reg == 1 {
+                    let page = ext.addr & !0xFF;
+                    let off = (ext.addr & 0xFF) as usize;
+                    let ent = rc4_page_writes.entry(page).or_insert((
+                        [0u64; 4],
+                        ext.seq_low32,
+                        ext.seq_low32,
+                        ext.pc,
+                        0,
+                    ));
+                    ent.0[off >> 6] |= 1u64 << (off & 63);
+                    if ext.seq_low32 < ent.1 {
+                        ent.1 = ext.seq_low32;
+                    }
+                    if ext.seq_low32 > ent.2 {
+                        ent.2 = ext.seq_low32;
+                    }
+                    ent.4 += 1;
+                }
                 if val <= u32::MAX as u64 {
                     let v32 = val as u32;
                     if let Some(algos) = const_map.get(&v32) {
@@ -1366,11 +1801,52 @@ impl TraceReader {
                     }
                 }
             }
+            for (_base, (mask, first_seq, first_pc)) in aes_sbox_hits {
+                if mask.count_ones() >= 6 {
+                    let map = seq_to_idx.get_or_insert_with(|| self.build_seq_index_map());
+                    if let Some(&first_idx) = map.get(&first_seq) {
+                        raw_hits
+                            .entry("AES (S-Box)")
+                            .or_default()
+                            .push((first_idx, first_pc, 0x637c_777b));
+                        raw_hits
+                            .entry("AES (S-Box)")
+                            .or_default()
+                            .push((first_idx, first_pc, 0xf26b_6fc5));
+                    }
+                }
+            }
+            for (_page, (bits, first_seq, last_seq, first_pc, cnt)) in rc4_page_writes {
+                let distinct_offs: u32 = bits.iter().map(|w| w.count_ones()).sum();
+                if cnt >= 256 && distinct_offs >= 128 && last_seq.saturating_sub(first_seq) <= 40_000
+                {
+                    let map = seq_to_idx.get_or_insert_with(|| self.build_seq_index_map());
+                    if let (Some(&start_i), Some(&end_i)) = (map.get(&first_seq), map.get(&last_seq))
+                    {
+                        let (lo, hi) = if start_i <= end_i {
+                            (start_i, end_i)
+                        } else {
+                            (end_i, start_i)
+                        };
+                        let (in_addrs, out_addrs) = self.infer_window_io_buffers(lo, hi);
+                        direct_groups.push(CryptoHitGroup {
+                            algorithm: "RC4 (256B-State)",
+                            start_idx: lo,
+                            end_idx: hi,
+                            first_pc,
+                            hit_count: cnt,
+                            distinct_constants: vec![distinct_offs, cnt as u32],
+                            input_addrs: in_addrs,
+                            output_addrs: out_addrs,
+                        });
+                    }
+                }
+            }
         }
 
         // 将同一算法在 2500 条指令窗口内的命中聚合成一次调用实例
         const WINDOW_GAP: usize = 2500;
-        let mut groups = Vec::new();
+        let mut groups = direct_groups;
         for (algo, mut events) in raw_hits {
             events.sort_by_key(|&(idx, _, _)| idx);
             let mut cur_start = 0usize;
@@ -1378,6 +1854,12 @@ impl TraceReader {
             let mut cur_pc = 0u64;
             let mut cur_hits = 0usize;
             let mut cur_consts: BTreeSet<u32> = BTreeSet::new();
+            let min_consts = if matches!(algo, "CRC32" | "AES (ARMv8-CE)" | "Simon-128" | "TEA/XTEA")
+            {
+                1
+            } else {
+                2
+            };
 
             for (idx, pc, c) in events {
                 if cur_hits == 0 {
@@ -1391,7 +1873,9 @@ impl TraceReader {
                     cur_hits += 1;
                     cur_consts.insert(c);
                 } else {
-                    if cur_consts.len() >= 2 || algo == "CRC32" {
+                    if cur_consts.len() >= min_consts {
+                        let (in_addrs, out_addrs) =
+                            self.infer_window_io_buffers(cur_start, cur_end);
                         groups.push(CryptoHitGroup {
                             algorithm: algo,
                             start_idx: cur_start,
@@ -1399,6 +1883,8 @@ impl TraceReader {
                             first_pc: cur_pc,
                             hit_count: cur_hits,
                             distinct_constants: cur_consts.iter().copied().collect(),
+                            input_addrs: in_addrs,
+                            output_addrs: out_addrs,
                         });
                     }
                     cur_start = idx;
@@ -1409,7 +1895,8 @@ impl TraceReader {
                     cur_consts.insert(c);
                 }
             }
-            if cur_hits > 0 && (cur_consts.len() >= 2 || algo == "CRC32") {
+            if cur_hits > 0 && cur_consts.len() >= min_consts {
+                let (in_addrs, out_addrs) = self.infer_window_io_buffers(cur_start, cur_end);
                 groups.push(CryptoHitGroup {
                     algorithm: algo,
                     start_idx: cur_start,
@@ -1417,6 +1904,8 @@ impl TraceReader {
                     first_pc: cur_pc,
                     hit_count: cur_hits,
                     distinct_constants: cur_consts.iter().copied().collect(),
+                    input_addrs: in_addrs,
+                    output_addrs: out_addrs,
                 });
             }
         }
@@ -1438,6 +1927,82 @@ impl TraceReader {
 
         groups.sort_by_key(|g| g.start_idx);
         groups
+    }
+
+    /// 结合 `.ext` 推断某算法执行窗口 `[start_idx..=end_idx]` 内的 Top 候选输入（先读/只读）与输出（写入）内存缓冲区
+    #[allow(clippy::type_complexity)]
+    fn infer_window_io_buffers(
+        &self,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> (Vec<(u64, usize)>, Vec<(u64, usize)>) {
+        if self.ext_mmap.is_none() || self.idx_count == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let s_idx = start_idx.saturating_sub(128);
+        let e_idx = end_idx.saturating_add(128).min(self.idx_count - 1);
+        let Some(rec_s) = self.get(s_idx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(rec_e) = self.get(e_idx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let min_seq = rec_s.seq_low32;
+        let max_seq = rec_e.seq_low32;
+        let Some(mmap) = self.ext_mmap.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let ext_end = self.ext_end_index_for_seq(max_seq);
+        let ext_start = if self.ext_monotonic && min_seq > 0 {
+            self.ext_end_index_for_seq(min_seq.saturating_sub(1))
+                .min(ext_end)
+        } else {
+            0
+        };
+        let mut read_bytes: BTreeSet<u64> = BTreeSet::new();
+        let mut written_bytes: BTreeSet<u64> = BTreeSet::new();
+        for i in ext_start..ext_end {
+            let ext = read_packed::<ExtRecord>(mmap, i);
+            let seq = ext.seq_low32;
+            if seq < min_seq || seq > max_seq {
+                continue;
+            }
+            let sz = (ext.size_or_reg as usize).clamp(1, 8);
+            match ExtKind::from_u8(ext.kind) {
+                Some(ExtKind::MemRead) => {
+                    for off in 0..sz {
+                        let a = ext.addr.wrapping_add(off as u64);
+                        if !written_bytes.contains(&a) {
+                            read_bytes.insert(a);
+                        }
+                    }
+                }
+                Some(ExtKind::MemWrite) => {
+                    for off in 0..sz {
+                        written_bytes.insert(ext.addr.wrapping_add(off as u64));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let coalesce = |set: &BTreeSet<u64>| -> Vec<(u64, usize)> {
+            let mut spans: Vec<(u64, usize)> = Vec::new();
+            for &a in set {
+                if let Some(last) = spans.last_mut() {
+                    if a == last.0.wrapping_add(last.1 as u64) {
+                        last.1 += 1;
+                        continue;
+                    }
+                }
+                spans.push((a, 1));
+            }
+            // 过滤掉单字节碎片，按长度降序保留 Top-4 候选缓冲
+            spans.retain(|&(_, l)| l >= 4);
+            spans.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            spans.truncate(4);
+            spans
+        };
+        (coalesce(&read_bytes), coalesce(&written_bytes))
     }
 
     fn attribute_pre_exec(&self, raw_idx: usize, raw_rec: TraceRecord) -> (usize, TraceRecord) {

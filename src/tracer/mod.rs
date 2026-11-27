@@ -9,8 +9,8 @@ pub use decompile::{DecompileOptions, DecompileReport, DecompiledInput, Decompil
 
 pub use engine::{attach_code_hook, attach_mem_trace_hook, BinaryTracer};
 pub use reader::{
-    resolve_sibling_ext_path, CallTreeNode, CryptoHitGroup, MemPatternHit, TraceDiffEntry,
-    TraceDiffSummary, TraceQueryHit, TraceReader,
+    resolve_sibling_ext_path, CallTreeNode, CryptoHitGroup, DiffTaintByteSpan, DiffTaintReport,
+    MemPatternHit, TraceDiffEntry, TraceDiffSummary, TraceQueryHit, TraceReader,
 };
 pub use record::{
     decode_instruction_with_reg, format_ascii_hint, ExtKind, ExtRecord, HleOpEvent, HleTraceEvent,

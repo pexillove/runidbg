@@ -371,13 +371,12 @@ fn test_slice_decompile_js_and_mcp_end_to_end() {
 
 #[test]
 fn test_slice_decompile_audit_regressions() {
-    // 1. P0-1 & P1-2: 含未建模指令 umulh (Opaque) 绝不可谎报 verified == Some(true)，
+    // 1. P0-1 & P1-2: 含未建模指令 cls (Opaque) 绝不可谎报 verified == Some(true)，
     //    且 Opaque 不产生嵌套注释、恶意 functionName 被安全净化并通过 cc -Wall -Werror 语法检查
     let in_u64 = 0x1122_3344_5566_7788u64;
     let asm_opaque = r#"
         ldr x4, [x0]
-        mov x5, #0x9e37
-        umulh x6, x4, x5
+        .word 0xdac01486
         add x6, x6, #1
         str x6, [x2]
         ret

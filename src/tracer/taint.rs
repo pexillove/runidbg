@@ -31,6 +31,12 @@ impl TaintSeed {
 pub struct TaintOptions {
     /// Forward: 起始指令下标（默认 0）；Backward: 目标观测点下标（默认最后一条指令）
     pub anchor_idx: Option<usize>,
+    /// Backward 模式下可选切片起点下界（含该指令；等价 `--from-seq`），精准截断到单轮循环或子阶段
+    pub min_idx: Option<usize>,
+    /// Backward 模式下命中这些 PC 时立即停止回溯（把当前边界寄存器/内存提升为输入起源）
+    pub stop_at_pcs: Vec<u64>,
+    /// Backward 模式下遇到读取这些内存区间 `(addr, len)` 时直接钉死为输入起源，不再追寻更早写入
+    pub stop_mem_ranges: Vec<(u64, usize)>,
     /// 最大扫描指令数（0 表示不限，扫描至 Trace 边界）
     pub max_insns: usize,
     /// 报告中最多保留的传播步骤条数（默认 512）
@@ -45,6 +51,9 @@ impl Default for TaintOptions {
     fn default() -> Self {
         Self {
             anchor_idx: None,
+            min_idx: None,
+            stop_at_pcs: Vec::new(),
+            stop_mem_ranges: Vec::new(),
             max_insns: 0,
             max_steps: 512,
             track_mem_index: true,
@@ -75,6 +84,8 @@ pub struct TaintReport {
     pub mode: &'static str,
     pub seed_desc: String,
     pub anchor_idx: usize,
+    /// 实际停止边界指令下标（Backward 模式为回溯停下的下界指令下标；Forward 模式为结束下标）
+    pub stop_idx: usize,
     pub scanned_insns: usize,
     pub total_matching_steps: usize,
     /// 按时间顺序排列的因果传播步骤（Backward 模式已反转为「起源 -> 目标」顺序）
@@ -83,6 +94,8 @@ pub struct TaintReport {
     pub tainted_regs: Vec<(String, u64)>,
     /// Forward: 结束时仍带污点的内存区间 `(start, len, tag_mask)`；Backward: 溯源起点未解出的输入内存区间
     pub tainted_mem_ranges: Vec<(u64, usize, u64)>,
+    /// Backward 模式下识别到的外部熵源/时钟源 HLE 起源标注（如 `[ORIGIN: HLE rand() #seq -> 0x...]`）
+    pub origin_annotations: Vec<String>,
 }
 
 impl TaintReport {
@@ -164,6 +177,16 @@ impl TaintReport {
                 })
                 .collect();
             out.push_str(&format!("# {end_label} - 内存区间: {}\n", mems.join(", ")));
+        }
+        if !self.origin_annotations.is_empty() {
+            out.push_str(&format!(
+                "# 外部熵源/时钟源起源标注:\n{}\n",
+                self.origin_annotations
+                    .iter()
+                    .map(|s| format!("  {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         }
         out
     }
@@ -930,13 +953,33 @@ fn lookup_reg_delta(reader: &TraceReader, idx: usize, reg_slot: u8) -> Option<u6
         .map(|(_, val)| val)
 }
 
-/// 判断该 HLE 事件是否将全新返回值（指针/状态码）写入 X0（不含 `memcpy`/`memmove` 透传原 `dst`）
+/// 判断该 HLE 事件是否将全新返回值（指针/状态码/熵源/时间戳）写入 X0（不含 `memcpy`/`memmove` 透传原 `dst`）
 #[inline]
-fn hle_defines_fresh_x0(op: &str) -> bool {
+pub(crate) fn hle_defines_fresh_x0(op: &str) -> bool {
     matches!(
         op,
-        "malloc" | "calloc" | "realloc" | "posix_memalign" | "free" | "bzero"
+        "malloc"
+            | "calloc"
+            | "realloc"
+            | "posix_memalign"
+            | "free"
+            | "bzero"
+            | "rand"
+            | "random"
+            | "lrand48"
+            | "arc4random"
+            | "time"
     )
+}
+
+#[inline]
+pub(crate) fn is_hle_entropy_or_time_reg(op: &str) -> bool {
+    matches!(op, "rand" | "random" | "lrand48" | "arc4random" | "time")
+}
+
+#[inline]
+pub(crate) fn is_hle_entropy_or_time_mem(op: &str) -> bool {
+    matches!(op, "getrandom" | "gettimeofday" | "clock_gettime")
 }
 
 impl TraceReader {
@@ -1351,11 +1394,13 @@ impl TraceReader {
             mode: "forward",
             seed_desc: seed.describe(),
             anchor_idx: start_idx,
+            stop_idx: end_idx,
             scanned_insns: end_idx.saturating_sub(start_idx),
             total_matching_steps,
             steps,
             tainted_regs,
             tainted_mem_ranges,
+            origin_annotations: Vec::new(),
         }
     }
 
@@ -1371,11 +1416,13 @@ impl TraceReader {
                 mode: "backward",
                 seed_desc: target.describe(),
                 anchor_idx: 0,
+                stop_idx: 0,
                 scanned_insns: 0,
                 total_matching_steps: 0,
                 steps: Vec::new(),
                 tainted_regs: Vec::new(),
                 tainted_mem_ranges: Vec::new(),
+                origin_annotations: Vec::new(),
             };
         }
 
@@ -1383,20 +1430,44 @@ impl TraceReader {
             .anchor_idx
             .unwrap_or_else(|| total.saturating_sub(1))
             .min(total.saturating_sub(1));
-        let stop_idx = if opts.max_insns > 0 {
+        let mut stop_idx = if opts.max_insns > 0 {
             anchor_idx.saturating_sub(opts.max_insns.saturating_sub(1))
         } else {
             0
         };
+        if let Some(min_i) = opts.min_idx {
+            if min_i > anchor_idx {
+                return TaintReport {
+                    mode: "backward",
+                    seed_desc: target.describe(),
+                    anchor_idx,
+                    stop_idx: min_i,
+                    scanned_insns: 0,
+                    total_matching_steps: 0,
+                    steps: Vec::new(),
+                    tainted_regs: Vec::new(),
+                    tainted_mem_ranges: Vec::new(),
+                    origin_annotations: Vec::new(),
+                };
+            }
+            stop_idx = stop_idx.max(min_i);
+        }
         let max_steps = if opts.max_steps == 0 {
             usize::MAX
         } else {
             opts.max_steps
         };
         let track_sp = opts.track_sp || matches!(target, TaintSeed::Reg { reg_id: 31 });
+        let is_stop_mem = |addr: u64| -> bool {
+            opts.stop_mem_ranges
+                .iter()
+                .any(|&(s, l)| addr >= s && addr < s.saturating_add(l as u64))
+        };
 
         let mut wanted_regs = [false; NUM_REG_SLOTS];
         let mut wanted_mem: BTreeSet<u64> = BTreeSet::new();
+        let mut pinned_origin_mem: BTreeSet<u64> = BTreeSet::new();
+        let mut origin_annotations: Vec<String> = Vec::new();
 
         match *target {
             TaintSeed::Mem { addr, len } => {
@@ -1416,6 +1487,7 @@ impl TraceReader {
         let mut rev_steps: Vec<TaintStep> = Vec::new();
         let mut total_matching_steps = 0usize;
         let mut scanned = 0usize;
+        let mut effective_stop_idx = stop_idx;
 
         let mut push_step = |step: TaintStep| {
             total_matching_steps += 1;
@@ -1426,37 +1498,88 @@ impl TraceReader {
 
         for idx in (stop_idx..=anchor_idx).rev() {
             if wanted_mem.is_empty() && !wanted_regs.iter().any(|&w| w) {
+                effective_stop_idx = idx.saturating_add(1).min(anchor_idx);
                 break;
             }
             let Some(rec) = self.get(idx) else {
                 continue;
             };
-            scanned += 1;
             let pc = rec.pc;
+            let hit_stop_pc = idx < anchor_idx && opts.stop_at_pcs.contains(&pc);
+            scanned += 1;
             let opcode = rec.opcode;
             let seq = rec.seq_low32;
 
-            // 1. 逆序先处理附着在本条指令上的 HLE 批量拷贝/清零与新返回值事件（兼容 BL/BLR、.plt BR X17、尾调用 B 及跳板 RET）
+            // 1. 逆序先处理附着在本条指令上的 HLE 批量拷贝/清零/外部源与新返回值事件
             let hle_evts = self.hle_events_for(idx);
             for hle in hle_evts.iter().rev() {
+                // 外部熵源/时钟源写入内存（如 getrandom / gettimeofday / clock_gettime / time(tloc)）
+                if (is_hle_entropy_or_time_mem(hle.op) || hle.op == "time")
+                    && hle.dst != 0
+                    && hle.len > 0
+                {
+                    let end = hle.dst.saturating_add(hle.len);
+                    let hit_addrs: Vec<u64> = wanted_mem.range(hle.dst..end).copied().collect();
+                    if !hit_addrs.is_empty() {
+                        for a in &hit_addrs {
+                            wanted_mem.remove(a);
+                        }
+                        let note = format!(
+                            "[ORIGIN: HLE {}() #{} @ 0x{:016x} -> mem[0x{:016x}+{}]]",
+                            hle.op, seq, hle.pc, hle.dst, hle.len
+                        );
+                        origin_annotations.push(note.clone());
+                        let (hle_asm, _) = decode_semantics(opcode, pc, track_sp);
+                        push_step(TaintStep {
+                            idx,
+                            seq,
+                            pc,
+                            asm: hle_asm,
+                            kind: "hle_origin",
+                            sources: vec![note],
+                            dests: vec![format!("mem[0x{:016x}+{}]", hle.dst, hle.len)],
+                            tag_mask: 0,
+                            value: Some(hle.src),
+                        });
+                    }
+                    continue;
+                }
                 apply_hle_backward(hle, idx, seq, &mut wanted_mem, &mut push_step);
+                // 若 HLE memcpy 将需求搬运进 stop_mem_ranges，立即钉死为边界输入
+                if !opts.stop_mem_ranges.is_empty() {
+                    let to_pin: Vec<u64> = wanted_mem.iter().copied().filter(|&a| is_stop_mem(a)).collect();
+                    for a in to_pin {
+                        wanted_mem.remove(&a);
+                        pinned_origin_mem.insert(a);
+                    }
+                }
             }
             if wanted_regs[0] {
                 if let Some(hle) = hle_evts.iter().rev().find(|h| hle_defines_fresh_x0(h.op)) {
                     wanted_regs[0] = false;
                     let fallback = match hle.op {
                         "posix_memalign" | "free" | "bzero" => Some(0),
+                        "rand" | "random" | "lrand48" | "arc4random" | "time" => Some(hle.src),
                         _ => Some(hle.dst),
                     };
                     let ret_val = lookup_reg_delta(self, idx, 0).or(fallback);
                     let (hle_asm, _) = decode_semantics(opcode, pc, track_sp);
+                    let is_entropy = is_hle_entropy_or_time_reg(hle.op);
+                    let src_label = if is_entropy {
+                        let vstr = ret_val.map(|v| format!(" -> 0x{v:x}")).unwrap_or_default();
+                        let note = format!("[ORIGIN: HLE {}() #{seq} @ 0x{:016x}{vstr}]", hle.op, hle.pc);
+                        origin_annotations.push(note.clone());
+                        note
+                    } else {
+                        format!("HLE {}(len={})", hle.op, hle.len)
+                    };
                     push_step(TaintStep {
                         idx,
                         seq,
                         pc,
                         asm: hle_asm,
-                        kind: "hle_ret",
-                        sources: vec![format!("HLE {}(len={})", hle.op, hle.len)],
+                        kind: if is_entropy { "hle_origin" } else { "hle_ret" },
+                        sources: vec![src_label],
                         dests: vec!["X0".to_string()],
                         tag_mask: 0,
                         value: ret_val,
@@ -1465,6 +1588,7 @@ impl TraceReader {
             }
 
             if wanted_mem.is_empty() && !wanted_regs.iter().any(|&w| w) {
+                effective_stop_idx = idx;
                 break;
             }
 
@@ -1672,7 +1796,11 @@ impl TraceReader {
                                 for &(a, sz, _) in &slot_reads[slot_i] {
                                     for off in 0..sz {
                                         if let Some(addr_b) = a.checked_add(off as u64) {
-                                            wanted_mem.insert(addr_b);
+                                            if is_stop_mem(addr_b) {
+                                                pinned_origin_mem.insert(addr_b);
+                                            } else {
+                                                wanted_mem.insert(addr_b);
+                                            }
                                         }
                                     }
                                     sources.push(format!("mem[0x{a:016x}+{sz}]"));
@@ -1718,7 +1846,11 @@ impl TraceReader {
                                 let r_addr = r.addr;
                                 for off in 0..sz {
                                     if let Some(addr_b) = r_addr.checked_add(off as u64) {
-                                        wanted_mem.insert(addr_b);
+                                        if is_stop_mem(addr_b) {
+                                            pinned_origin_mem.insert(addr_b);
+                                        } else {
+                                            wanted_mem.insert(addr_b);
+                                        }
                                     }
                                 }
                                 sources.push(format!("mem[0x{r_addr:016x}+{sz}]"));
@@ -1784,7 +1916,11 @@ impl TraceReader {
                                 let r_addr = r.addr;
                                 for off in 0..sz {
                                     if let Some(addr_b) = r_addr.checked_add(off as u64) {
-                                        wanted_mem.insert(addr_b);
+                                        if is_stop_mem(addr_b) {
+                                            pinned_origin_mem.insert(addr_b);
+                                        } else {
+                                            wanted_mem.insert(addr_b);
+                                        }
                                     }
                                 }
                                 sources.push(format!("mem[0x{r_addr:016x}+{sz}]"));
@@ -1845,10 +1981,16 @@ impl TraceReader {
                     }
                 }
             }
+            if hit_stop_pc {
+                effective_stop_idx = idx;
+                break;
+            }
         }
 
         // 反转为时间正序（起源 -> 目标），便于人类和 AI Agent 自上而下阅读
         rev_steps.reverse();
+        origin_annotations.reverse();
+        wanted_mem.extend(pinned_origin_mem);
 
         let tainted_regs: Vec<(String, u64)> = wanted_regs
             .iter()
@@ -1862,11 +2004,13 @@ impl TraceReader {
             mode: "backward",
             seed_desc: target.describe(),
             anchor_idx,
+            stop_idx: effective_stop_idx,
             scanned_insns: scanned,
             total_matching_steps,
             steps: rev_steps,
             tainted_regs,
             tainted_mem_ranges,
+            origin_annotations,
         }
     }
 }
@@ -1948,6 +2092,31 @@ fn apply_hle_forward<F>(
                     dests: vec![format!("mem[0x{:016x}+{}]", hle.dst, hle.len)],
                     tag_mask: 0,
                     value: Some(fill_byte as u64),
+                });
+            }
+        }
+        op if (is_hle_entropy_or_time_mem(op) || op == "time") && hle.dst != 0 => {
+            let dst_last = hle.dst.saturating_add(len - 1);
+            let mut cleared = false;
+            mem_taint.retain(|&a, _| {
+                if a >= hle.dst && a <= dst_last {
+                    cleared = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            if cleared {
+                push_step(TaintStep {
+                    idx,
+                    seq,
+                    pc: hle.pc,
+                    asm: format!("HLE {}(dst=0x{:x}, len={})", hle.op, hle.dst, hle.len),
+                    kind: "hle_clear",
+                    sources: vec![format!("HLE {}()", hle.op)],
+                    dests: vec![format!("mem[0x{:016x}+{}]", hle.dst, hle.len)],
+                    tag_mask: 0,
+                    value: Some(hle.src),
                 });
             }
         }

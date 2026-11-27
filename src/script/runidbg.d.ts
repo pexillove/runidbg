@@ -911,6 +911,10 @@ interface VmAnalyzeOptions {
   minHandlers?: number;
   /** 自动识别调度点所需最少分发次数（默认 4） */
   minDispatches?: number;
+  /** 可选：起始指令下标（含；等价 `--seq-range <start>..<end>`） */
+  minIdx?: number;
+  /** 可选：结束指令下标（含；等价 `--seq-range <start>..<end>`） */
+  maxIdx?: number;
   /** 最大扫描原生指令数（0 = 全部） */
   maxInsns?: number;
   /** 返回轨迹最多保留的 VM 步数（默认 256，`0` 表示不限） */
@@ -987,17 +991,21 @@ interface VmAnalysisReport {
 
 interface TraceQueryOptions {
   /** 按写入值查询（配合 `width` 1..8 字节） */
-  value?: number | bigint;
+  value?: number | bigint | string;
   /** 值匹配字节宽度（默认 `value > 0xFFFFFFFF` 时为 8，否则为 4；范围 1..8） */
   width?: number;
   /** `width` 的别名 */
   align?: number;
   /** 按目标内存地址查询读写及 HLE 访问历史 */
-  addr?: number | bigint;
+  addr?: number | bigint | string;
   /** 按地址查询时的字节长度（默认 1） */
   len?: number;
   /** 按地址查询时是否仅返回写事件与 HLE 变更事件（默认 false） */
   writesOnly?: boolean;
+  /** 按地址查询时的事件类型过滤：`"r"` 仅读、`"w"` 仅写、`"rw"` 读写全部（默认 `"rw"`） */
+  kind?: "r" | "w" | "rw";
+  /** 按地址查询时是否包含 HLE 事件（默认 true） */
+  includeHle?: boolean;
   /** 仅返回序号 >= `minSeq` 的事件 */
   minSeq?: number;
   /** 仅返回序号 <= `maxSeq` 的事件 */
@@ -1017,6 +1025,8 @@ interface TraceQueryHit {
   readonly size: number;
   readonly kind: string;
   readonly value: number;
+  /** 64 位无损 BigInt 值（与 `ctx.reg64` 精度一致） */
+  readonly value64: bigint;
   readonly valueHex: string;
   /** 仅 `hle_memcpy` / `hle_memmove` / `hle_realloc_copy` 事件存在源地址 */
   readonly src?: number;
@@ -1073,6 +1083,12 @@ interface TraceTaintOptions {
   atIdx?: number;
   /** `atIdx` 的前向语义别名 */
   startIdx?: number;
+  /** Backward 模式下切片起点下界（含该指令；精准截断到单轮循环或子阶段） */
+  fromIdx?: number;
+  /** Backward 模式下命中这些 PC 时停止回溯，把边界状态提升为输入起源 */
+  stopAtPcs?: Array<number | bigint | string>;
+  /** Backward 模式下遇到读取这些内存区间时直接钉死为输入起源 */
+  stopMem?: Array<{ addr: number | bigint | string; len?: number }>;
   /** 最大扫描指令数（0 表示扫描全部） */
   maxInsns?: number;
   /** 返回报告最多保留的步骤条数（默认 512） */
@@ -1089,7 +1105,7 @@ interface TraceTaintStep {
   readonly pc: number;
   readonly pcHex: string;
   readonly asm: string;
-  readonly kind: "load" | "store" | "alu" | "rmw" | "const" | "hle_copy" | "hle_clear" | "hle_ret";
+  readonly kind: "load" | "store" | "alu" | "rmw" | "const" | "hle_copy" | "hle_clear" | "hle_ret" | "hle_origin";
   readonly sources: string[];
   readonly dests: string[];
   readonly tagMaskHex: string;
@@ -1101,8 +1117,10 @@ interface TraceTaintReport {
   readonly mode: "forward" | "backward";
   readonly seed: string;
   readonly anchorIdx: number;
+  readonly stopIdx: number;
   readonly scannedInsns: number;
   readonly totalMatchingSteps: number;
+  readonly originAnnotations: string[];
   readonly steps: TraceTaintStep[];
   readonly taintedRegs: Array<{ readonly name: string; readonly tagMaskHex: string }>;
   readonly taintedMemRanges: Array<{
@@ -1122,6 +1140,14 @@ interface TraceDecompileOptions {
   reg?: string;
   /** 观测点指令下标（默认末条指令） */
   atIdx?: number;
+  /** 切片起点下界（含该指令；将单轮循环/子阶段入口状态直接提升为符号参数） */
+  fromIdx?: number;
+  /** 命中这些 PC 时停止回溯并提升边界寄存器/内存为输入参数 */
+  stopAtPcs?: Array<number | bigint | string>;
+  /** 遇到读取这些内存区间时直接钉死为输入参数 */
+  stopMem?: Array<{ addr: number | bigint | string; len?: number }>;
+  /** 将整个 Trace 中从未被写过的只读内存（如 `.rodata` / VM 字节码）折叠为常量（默认 false） */
+  foldRodata?: boolean;
   /** 最大扫描指令数（0 表示全部） */
   maxInsns?: number;
   /** 最大切片步数（默认 4096） */
@@ -1132,7 +1158,7 @@ interface TraceDecompileOptions {
   trackSp?: boolean;
   /** 生成的 C 函数名称（默认 `"decompiled_slice"`） */
   functionName?: string;
-  /** 是否启用代数/旋转/MBA 反混淆化简（默认 true） */
+  /** 是否启用代数/旋转/MBA/字节重装化简（默认 true） */
   simplify?: boolean;
   /** 是否额外导出标准 `QF_BV` SMT-LIB2 文本（默认 false） */
   emitSmt2?: boolean;
@@ -1143,10 +1169,12 @@ interface TraceDecompileOptions {
 interface TraceDecompileReport {
   readonly seed: string;
   readonly anchorIdx: number;
+  readonly stopIdx: number;
   readonly scannedInsns: number;
   readonly sliceInsns: number;
   readonly rawNodes: number;
   readonly simplifiedNodes: number;
+  readonly originAnnotations: string[];
   readonly expectedOutputHex?: string;
   readonly evaluatedOutputHex?: string;
   readonly verified: boolean | null;
@@ -1154,7 +1182,7 @@ interface TraceDecompileReport {
   readonly smt2: string | null;
   readonly inputs: Array<{
     readonly name: string;
-    readonly kind: "reg" | "mem";
+    readonly kind: "reg" | "mem" | "hle_source";
     readonly addrHex?: string;
     readonly widthBytes: number;
     readonly sampleHex?: string;
@@ -1167,30 +1195,62 @@ interface TraceDecompileReport {
   }>;
 }
 
+interface TraceDiffTaintSpan {
+  readonly offset: number;
+  readonly addrHex: string;
+  readonly len: number;
+  readonly bytesAHex: string;
+  readonly bytesBHex: string;
+  readonly originsARegs: string[];
+  readonly originsAMem: string[];
+  readonly originsAHle: string[];
+  readonly originsBRegs: string[];
+  readonly originsBMem: string[];
+  readonly originsBHle: string[];
+}
+
+interface TraceDiffTaintReport {
+  readonly targetAddrHex: string;
+  readonly len: number;
+  readonly identicalBytes: number;
+  readonly differingBytes: number;
+  readonly spans: TraceDiffTaintSpan[];
+  readonly summaryText: string;
+}
+
 interface TraceReaderHandle {
   readonly totalInsns: number;
   readonly totalExt: number;
+  /** 若 `.idx` 录制于 `full` 级别但缺失同级 `.ext` 文件则为 `true` */
+  readonly missingExtWarning: boolean;
+  /** 录制级别（`"fast"` | `"reg_delta"` | `"full"` | `null`） */
+  readonly recordedLevel: "fast" | "reg_delta" | "full" | null;
   /** 离线全知内存/值查询（内置替代手写 numpy 扫描 `.idx`/`.ext`） */
   query(opts: TraceQueryOptions): TraceQueryHit[];
   /** 值溯源便捷别名：查找所有写入过 `value` 的 guest 指令与 HLE 拷贝事件 */
   findWrites(
-    value: number | bigint,
-    opts?: Omit<TraceQueryOptions, "value" | "addr" | "len" | "writesOnly">
+    value: number | bigint | string,
+    opts?: Omit<TraceQueryOptions, "value" | "addr" | "len" | "writesOnly" | "kind" | "includeHle">
   ): TraceQueryHit[];
   /** 地址溯源便捷别名：查找访问 `addr` 的读写及 HLE 历史事件（默认 `writesOnly: false`） */
   findReads(
-    addr: number | bigint,
+    addr: number | bigint | string,
     opts?: Omit<TraceQueryOptions, "value" | "addr" | "width" | "align">
   ): TraceQueryHit[];
-  /** 读取 trace.ext 中的全部 HLE 事件（memcpy / memmove / memset / malloc / calloc / realloc / free） */
+  /** 通用内存访存查询（支持 `kind: "r" | "w" | "rw"`, `len`, `minSeq`, `maxSeq`, `includeHle`） */
+  findMem(
+    addr: number | bigint | string,
+    opts?: Omit<TraceQueryOptions, "value" | "addr" | "width" | "align">
+  ): TraceQueryHit[];
+  /** 读取 trace.ext 中的全部 HLE 事件（memcpy / memmove / memset / malloc / calloc / realloc / free / rand / gettimeofday 等） */
   hleEvents(limit?: number): TraceHleEvent[];
   /** 基于 trace.ext 写历史 + HLE 拷贝/填充事件重建指定 `atSeq`（省略则重建至末尾）时刻的内存区间内容 */
-  reconstructMem(addr: number | bigint, len: number, atSeq?: number): TraceReconstructResult;
+  reconstructMem(addr: number | bigint | string, len: number, atSeq?: number): TraceReconstructResult;
   /** 离线前向污点传播：从输入内存/寄存器出发，沿 ARM64 指令与 HLE memcpy 追踪污点流向（自动清除被覆写旧地址，免疫栈/VM 地址复用） */
   taintForward(opts: TraceTaintOptions): TraceTaintReport;
   /** 离线反向因果切片：从输出字节/寄存器倒推精确的指令与 HLE 计算链，直达输入起源 */
   taintBackward(opts: TraceTaintOptions): TraceTaintReport;
-  /** 动态污点切片 → 单路径符号提升 → 代数/MBA 化简 → 自校验精简伪 C（及可选 SMT-LIB2） */
+  /** 动态污点切片 → 单路径符号提升 → 代数/MBA/字节重装化简 → 自校验精简伪 C（及可选 SMT-LIB2） */
   decompileSlice(opts: TraceDecompileOptions): TraceDecompileReport;
   /** `decompileSlice` 的便捷别名 */
   taintToC(opts: TraceDecompileOptions): TraceDecompileReport;
@@ -1204,6 +1264,14 @@ declare namespace Trace {
   function open(idxPath: string, extPath?: string): TraceReaderHandle;
   /** 双跑 Trace 差分：定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧 */
   function diff(idxA: string, idxB: string, maxDiffs?: number): TraceDiffSummary;
+  /** 双跑差分 + 自动反向污点联动：比对目标缓冲区在两次运行中的差异字节段并分别反向溯源到起源寄存器/内存/HLE 熵源 */
+  function diffTaint(
+    idxA: string,
+    idxB: string,
+    addr: number | bigint | string,
+    len?: number,
+    maxInsns?: number
+  ): TraceDiffTaintReport;
 }
 
 declare namespace Emu {

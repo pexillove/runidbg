@@ -4829,6 +4829,8 @@ pub(super) fn register_native_bridge<'js>(
                         .map_err(|e| throw_err(&ctx, e))?;
                     let total_insns = reader.len();
                     let total_ext = reader.ext_len();
+                    let missing_ext = reader.missing_ext_warning();
+                    let recorded_level = reader.recorded_level_name();
                     let mut h = host
                         .try_borrow_mut()
                         .map_err(|_| throw_err(&ctx, "不可重入"))?;
@@ -4838,6 +4840,12 @@ pub(super) fn register_native_bridge<'js>(
                     out.set("traceId", trace_id)?;
                     out.set("totalInsns", total_insns as f64)?;
                     out.set("totalExt", total_ext as f64)?;
+                    out.set("missingExtWarning", missing_ext)?;
+                    if let Some(lvl) = recorded_level {
+                        out.set("recordedLevel", lvl)?;
+                    } else {
+                        out.set("recordedLevel", Value::new_null(ctx.clone()))?;
+                    }
                     Ok(out)
                 },
             )?,
@@ -4922,19 +4930,77 @@ pub(super) fn register_native_bridge<'js>(
                         reader.query_writes_by_value(target, width, min_seq, upper_seq, limit)
                     } else if let Some(av) = addr_opt {
                         let addr = js_addr_to_u64_strict(&ctx, &av)?;
-                        let len = opts
-                            .get::<_, f64>("len")
-                            .ok()
-                            .filter(|l| l.is_finite() && *l >= 1.0)
-                            .map(|l| l as u64)
-                            .unwrap_or(1);
-                        let writes_only: bool = opts.get("writesOnly").unwrap_or(false);
-                        reader.query_addr_history_in_range(
+                        let len = match opts.get::<_, Value<'js>>("len") {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => {
+                                let n = v.as_number().ok_or_else(|| {
+                                    throw_err(&ctx, "trace.query 参数 len 必须为正整数")
+                                })?;
+                                let u = require_nonneg_int(&ctx, n, "len")?;
+                                if u == 0 {
+                                    return Err(throw_err(&ctx, "trace.query 参数 len 必须 >= 1"));
+                                }
+                                u
+                            }
+                            _ => 1,
+                        };
+                        let writes_only: Option<bool> = match opts.get::<_, Value<'js>>("writesOnly") {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => Some(
+                                v.as_bool().ok_or_else(|| {
+                                    throw_err(&ctx, "trace.query 参数 writesOnly 必须为布尔值")
+                                })?,
+                            ),
+                            _ => None,
+                        };
+                        let kind_str: Option<String> = match opts.get::<_, Value<'js>>("kind") {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => Some(
+                                v.as_string()
+                                    .and_then(|s| s.to_string().ok())
+                                    .ok_or_else(|| {
+                                        throw_err(&ctx, "trace.query 参数 kind 必须为字符串 (\"r\" | \"w\" | \"rw\")")
+                                    })?
+                                    .to_ascii_lowercase(),
+                            ),
+                            _ => None,
+                        };
+                        let (include_reads, include_writes) = match (kind_str.as_deref(), writes_only) {
+                            (Some("r" | "read" | "reads"), Some(true)) => {
+                                return Err(throw_err(
+                                    &ctx,
+                                    "trace.query 参数 kind=\"r\" 与 writesOnly=true 互斥",
+                                ));
+                            }
+                            (Some("r" | "read" | "reads"), _) => (true, false),
+                            (Some("w" | "write" | "writes"), _) => (false, true),
+                            (Some("rw" | "all"), Some(true)) => {
+                                return Err(throw_err(
+                                    &ctx,
+                                    "trace.query 参数 kind=\"rw\" 与 writesOnly=true 互斥",
+                                ));
+                            }
+                            (Some("rw" | "all"), _) => (true, true),
+                            (None, Some(true)) => (false, true),
+                            (None, _) => (true, true),
+                            (Some(other), _) => {
+                                return Err(throw_err(
+                                    &ctx,
+                                    format!("无效的 trace.query kind `{other}`（支持 \"r\" | \"w\" | \"rw\"）"),
+                                ));
+                            }
+                        };
+                        let include_hle: bool = match opts.get::<_, Value<'js>>("includeHle") {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => v.as_bool().ok_or_else(|| {
+                                throw_err(&ctx, "trace.query 参数 includeHle 必须为布尔值")
+                            })?,
+                            _ => true,
+                        };
+                        reader.query_addr_history_filtered(
                             addr,
                             len,
                             min_seq,
                             upper_seq,
-                            writes_only,
+                            include_reads,
+                            include_writes,
+                            include_hle,
                             limit,
                         )
                     } else {
@@ -4952,6 +5018,7 @@ pub(super) fn register_native_bridge<'js>(
                         o.set("size", hit.size as f64)?;
                         o.set("kind", hit.kind)?;
                         o.set("value", hit.value as f64)?;
+                        o.set("value64", BigInt::from_u64(ctx.clone(), hit.value)?)?;
                         o.set("valueHex", format!("0x{:x}", hit.value))?;
                         if hit.src != 0 {
                             o.set("src", hit.src as f64)?;
@@ -5013,7 +5080,14 @@ pub(super) fn register_native_bridge<'js>(
                       at_seq_val: Value<'js>|
                       -> rquickjs::Result<Object<'js>> {
                     let addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
-                    let byte_len = require_nonneg_int(&ctx, len, "len")?.min(65536) as usize;
+                    let byte_len_u64 = require_nonneg_int(&ctx, len, "len")?;
+                    if byte_len_u64 > 65536 {
+                        return Err(throw_err(
+                            &ctx,
+                            format!("reconstructMem 参数 len 超出上限 65536: {byte_len_u64}"),
+                        ));
+                    }
+                    let byte_len = byte_len_u64 as usize;
                     let seq = if at_seq_val.is_undefined() || at_seq_val.is_null() {
                         u32::MAX
                     } else {
@@ -5124,6 +5198,64 @@ pub(super) fn register_native_bridge<'js>(
                         .map(|v| js_addr_to_u64_strict(&ctx, &v).map(|n| n as usize))
                         .transpose()?;
 
+                    let min_idx: Option<usize> = opts
+                        .get::<_, Value<'js>>("fromIdx")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                        .or_else(|| {
+                            opts.get::<_, Value<'js>>("minIdx")
+                                .ok()
+                                .filter(|v| !v.is_undefined() && !v.is_null())
+                        })
+                        .map(|v| js_addr_to_u64_strict(&ctx, &v).map(|n| n as usize))
+                        .transpose()?;
+
+                    let mut stop_at_pcs: Vec<u64> = Vec::new();
+                    if let Ok(pcs_val) = opts.get::<_, Value<'js>>("stopAtPcs") {
+                        if !pcs_val.is_undefined() && !pcs_val.is_null() {
+                            let arr = pcs_val.as_array().ok_or_else(|| {
+                                throw_err(&ctx, "taint 参数 stopAtPcs 必须为地址数组")
+                            })?;
+                            for idx_i in 0..arr.len() {
+                                let v: Value<'js> = arr.get(idx_i)?;
+                                stop_at_pcs.push(js_addr_to_u64_strict(&ctx, &v)?);
+                            }
+                        }
+                    }
+                    let mut stop_mem_ranges: Vec<(u64, usize)> = Vec::new();
+                    if let Ok(sm_val) = opts.get::<_, Value<'js>>("stopMem") {
+                        if !sm_val.is_undefined() && !sm_val.is_null() {
+                            let arr = sm_val.as_array().ok_or_else(|| {
+                                throw_err(&ctx, "taint 参数 stopMem 必须为 { addr, len? } 对象数组")
+                            })?;
+                            for idx_i in 0..arr.len() {
+                                let item: Value<'js> = arr.get(idx_i)?;
+                                let obj = item.as_object().ok_or_else(|| {
+                                    throw_err(&ctx, "taint 参数 stopMem 数组元素必须为对象")
+                                })?;
+                                let av: Value<'js> = obj.get("addr")?;
+                                let a = js_addr_to_u64_strict(&ctx, &av)?;
+                                let l = match obj.get::<_, Value<'js>>("len") {
+                                    Ok(lv) if !lv.is_undefined() && !lv.is_null() => {
+                                        let n = lv.as_number().ok_or_else(|| {
+                                            throw_err(&ctx, "stopMem[].len 必须为正整数")
+                                        })?;
+                                        let u = require_nonneg_int(&ctx, n, "stopMem[].len")?;
+                                        if u == 0 || u > 65536 {
+                                            return Err(throw_err(
+                                                &ctx,
+                                                format!("stopMem[].len 必须在 1..=65536 之间，收到 {u}"),
+                                            ));
+                                        }
+                                        u as usize
+                                    }
+                                    _ => 8,
+                                };
+                                stop_mem_ranges.push((a, l));
+                            }
+                        }
+                    }
+
                     let max_insns = opts
                         .get::<_, f64>("maxInsns")
                         .ok()
@@ -5141,6 +5273,9 @@ pub(super) fn register_native_bridge<'js>(
 
                     let taint_opts = crate::tracer::TaintOptions {
                         anchor_idx,
+                        min_idx,
+                        stop_at_pcs,
+                        stop_mem_ranges,
                         max_insns,
                         max_steps,
                         track_mem_index,
@@ -5169,8 +5304,14 @@ pub(super) fn register_native_bridge<'js>(
                     out.set("mode", report.mode)?;
                     out.set("seed", report.seed_desc)?;
                     out.set("anchorIdx", report.anchor_idx as f64)?;
+                    out.set("stopIdx", report.stop_idx as f64)?;
                     out.set("scannedInsns", report.scanned_insns as f64)?;
                     out.set("totalMatchingSteps", report.total_matching_steps as f64)?;
+                    let orig_arr = Array::new(ctx.clone())?;
+                    for (i, o_str) in report.origin_annotations.iter().enumerate() {
+                        orig_arr.set(i, o_str.as_str())?;
+                    }
+                    out.set("originAnnotations", orig_arr)?;
 
                     let steps_arr = Array::new(ctx.clone())?;
                     for (i, s) in report.steps.iter().enumerate() {
@@ -5271,10 +5412,68 @@ pub(super) fn register_native_bridge<'js>(
                     };
 
                     let anchor_idx: Option<usize> = opts
-                        .get::<_, f64>("atIdx")
+                        .get::<_, Value<'js>>("atIdx")
                         .ok()
-                        .filter(|v| v.is_finite() && *v >= 0.0)
-                        .map(|v| v as usize);
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                        .map(|v| js_addr_to_u64_strict(&ctx, &v).map(|n| n as usize))
+                        .transpose()?;
+                    let from_idx: Option<usize> = opts
+                        .get::<_, Value<'js>>("fromIdx")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                        .or_else(|| {
+                            opts.get::<_, Value<'js>>("minIdx")
+                                .ok()
+                                .filter(|v| !v.is_undefined() && !v.is_null())
+                        })
+                        .map(|v| js_addr_to_u64_strict(&ctx, &v).map(|n| n as usize))
+                        .transpose()?;
+                    let mut stop_at_pcs: Vec<u64> = Vec::new();
+                    if let Ok(pcs_val) = opts.get::<_, Value<'js>>("stopAtPcs") {
+                        if !pcs_val.is_undefined() && !pcs_val.is_null() {
+                            let arr = pcs_val.as_array().ok_or_else(|| {
+                                throw_err(&ctx, "taint 参数 stopAtPcs 必须为地址数组")
+                            })?;
+                            for idx_i in 0..arr.len() {
+                                let v: Value<'js> = arr.get(idx_i)?;
+                                stop_at_pcs.push(js_addr_to_u64_strict(&ctx, &v)?);
+                            }
+                        }
+                    }
+                    let mut stop_mem_ranges: Vec<(u64, usize)> = Vec::new();
+                    if let Ok(sm_val) = opts.get::<_, Value<'js>>("stopMem") {
+                        if !sm_val.is_undefined() && !sm_val.is_null() {
+                            let arr = sm_val.as_array().ok_or_else(|| {
+                                throw_err(&ctx, "taint 参数 stopMem 必须为 { addr, len? } 对象数组")
+                            })?;
+                            for idx_i in 0..arr.len() {
+                                let item: Value<'js> = arr.get(idx_i)?;
+                                let obj = item.as_object().ok_or_else(|| {
+                                    throw_err(&ctx, "taint 参数 stopMem 数组元素必须为对象")
+                                })?;
+                                let av: Value<'js> = obj.get("addr")?;
+                                let a = js_addr_to_u64_strict(&ctx, &av)?;
+                                let l = match obj.get::<_, Value<'js>>("len") {
+                                    Ok(lv) if !lv.is_undefined() && !lv.is_null() => {
+                                        let n = lv.as_number().ok_or_else(|| {
+                                            throw_err(&ctx, "stopMem[].len 必须为正整数")
+                                        })?;
+                                        let u = require_nonneg_int(&ctx, n, "stopMem[].len")?;
+                                        if u == 0 || u > 65536 {
+                                            return Err(throw_err(
+                                                &ctx,
+                                                format!("stopMem[].len 必须在 1..=65536 之间，收到 {u}"),
+                                            ));
+                                        }
+                                        u as usize
+                                    }
+                                    _ => 8,
+                                };
+                                stop_mem_ranges.push((a, l));
+                            }
+                        }
+                    }
+                    let fold_rodata: bool = opts.get("foldRodata").unwrap_or(false);
                     let max_insns: usize = opts
                         .get::<_, f64>("maxInsns")
                         .ok()
@@ -5311,6 +5510,10 @@ pub(super) fn register_native_bridge<'js>(
 
                     let decomp_opts = crate::tracer::DecompileOptions {
                         anchor_idx,
+                        from_idx,
+                        stop_at_pcs,
+                        stop_mem_ranges,
+                        fold_rodata,
                         max_insns,
                         max_steps,
                         track_mem_index,
@@ -5332,7 +5535,13 @@ pub(super) fn register_native_bridge<'js>(
                     let out = Object::new(ctx.clone())?;
                     out.set("seed", report.seed_desc)?;
                     out.set("anchorIdx", report.anchor_idx as f64)?;
+                    out.set("stopIdx", report.stop_idx as f64)?;
                     out.set("scannedInsns", report.scanned_insns as f64)?;
+                    let orig_arr = Array::new(ctx.clone())?;
+                    for (i, o_str) in report.origin_annotations.iter().enumerate() {
+                        orig_arr.set(i, o_str.as_str())?;
+                    }
+                    out.set("originAnnotations", orig_arr)?;
                     out.set("sliceInsns", report.slice_insns as f64)?;
                     out.set("rawNodes", report.raw_nodes as f64)?;
                     out.set("simplifiedNodes", report.simplified_nodes as f64)?;
@@ -5597,6 +5806,20 @@ pub(super) fn register_native_bridge<'js>(
                         }
                         cfg.min_dispatches = n as usize;
                     }
+                    if let Some(n) = parse_opt_u64("minIdx")? {
+                        cfg.min_idx = Some(n as usize);
+                    }
+                    if let Some(n) = parse_opt_u64("maxIdx")? {
+                        cfg.max_idx = Some(n as usize);
+                    }
+                    if let (Some(lo), Some(hi)) = (cfg.min_idx, cfg.max_idx) {
+                        if lo > hi {
+                            return Err(throw_err(
+                                &ctx,
+                                format!("vmAnalyze 参数 minIdx ({lo}) 不能大于 maxIdx ({hi})"),
+                            ));
+                        }
+                    }
                     if let Some(n) = parse_opt_u64("maxInsns")? {
                         cfg.max_insns = n as usize;
                     }
@@ -5814,6 +6037,96 @@ pub(super) fn register_native_bridge<'js>(
                         arr.set(i, o)?;
                     }
                     out.set("diffs", arr)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        native.set(
+            "traceDiffTaint",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      idx_a: String,
+                      idx_b: String,
+                      addr_val: Value<'js>,
+                      len: f64,
+                      max_insns: f64|
+                      -> rquickjs::Result<Object<'js>> {
+                    let target_addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
+                    let byte_len_u64 = require_nonneg_int(&ctx, len, "len")?;
+                    if byte_len_u64 == 0 || byte_len_u64 > 4096 {
+                        return Err(throw_err(
+                            &ctx,
+                            format!("Trace.diffTaint 参数 len 必须在 1..=4096 之间，收到 {byte_len_u64}"),
+                        ));
+                    }
+                    let byte_len = byte_len_u64 as usize;
+                    let mi = require_nonneg_int(&ctx, max_insns, "maxInsns")? as usize;
+                    let pa = std::path::PathBuf::from(&idx_a);
+                    let pb = std::path::PathBuf::from(&idx_b);
+                    let ea = crate::tracer::resolve_sibling_ext_path(&pa);
+                    let eb = crate::tracer::resolve_sibling_ext_path(&pb);
+                    let ra = crate::tracer::TraceReader::open(&pa, ea.as_deref())
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let rb = crate::tracer::TraceReader::open(&pb, eb.as_deref())
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let report = crate::tracer::TraceReader::diff_taint_bytes(
+                        &ra,
+                        &rb,
+                        target_addr,
+                        byte_len,
+                        mi,
+                    );
+                    let out = Object::new(ctx.clone())?;
+                    out.set("targetAddrHex", format!("0x{:016x}", report.target_addr))?;
+                    out.set("len", report.len as f64)?;
+                    out.set("identicalBytes", report.identical_bytes as f64)?;
+                    out.set("differingBytes", report.differing_bytes as f64)?;
+                    out.set("summaryText", report.format_summary())?;
+                    let spans_arr = Array::new(ctx.clone())?;
+                    let fmt_opt_bytes = |bs: &[Option<u8>]| -> String {
+                        let mut s = String::with_capacity(bs.len() * 2);
+                        for b in bs {
+                            match b {
+                                Some(v) => s.push_str(&format!("{v:02x}")),
+                                None => s.push_str("??"),
+                            }
+                        }
+                        s
+                    };
+                    for (i, sp) in report.spans.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("offset", sp.offset as f64)?;
+                        o.set("addrHex", format!("0x{:016x}", sp.addr))?;
+                        o.set("len", sp.len as f64)?;
+                        o.set("bytesAHex", fmt_opt_bytes(&sp.bytes_a))?;
+                        o.set("bytesBHex", fmt_opt_bytes(&sp.bytes_b))?;
+                        let to_str_arr = |items: &[String]| -> rquickjs::Result<Array<'js>> {
+                            let a = Array::new(ctx.clone())?;
+                            for (j, it) in items.iter().enumerate() {
+                                a.set(j, it.as_str())?;
+                            }
+                            Ok(a)
+                        };
+                        let to_mem_arr = |items: &[(u64, usize)]| -> rquickjs::Result<Array<'js>> {
+                            let a = Array::new(ctx.clone())?;
+                            for (j, &(addr, l)) in items.iter().enumerate() {
+                                a.set(j, format!("0x{addr:x}[{l}]"))?;
+                            }
+                            Ok(a)
+                        };
+                        o.set("originsARegs", to_str_arr(&sp.origins_a_regs)?)?;
+                        o.set("originsAMem", to_mem_arr(&sp.origins_a_mem)?)?;
+                        o.set("originsAHle", to_str_arr(&sp.origins_a_hle)?)?;
+                        o.set("originsBRegs", to_str_arr(&sp.origins_b_regs)?)?;
+                        o.set("originsBMem", to_mem_arr(&sp.origins_b_mem)?)?;
+                        o.set("originsBHle", to_str_arr(&sp.origins_b_hle)?)?;
+                        spans_arr.set(i, o)?;
+                    }
+                    out.set("spans", spans_arr)?;
                     Ok(out)
                 },
             )?,
