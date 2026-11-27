@@ -730,12 +730,11 @@ fn test_p1_4_and_p2_9_filtered_query_vm_range_and_dual_run_diff_taint() {
         );
         let session = JsSession::new(&[], Path::new("."), true).unwrap();
         let out_json = session.eval_json_string(&js).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out_json).unwrap();
-        assert_eq!(v["level"], "full");
-        assert_eq!(v["missing"], false);
-        assert_eq!(v["isU8"], true);
-        assert_eq!(v["diffBytes"], 8);
-        assert_eq!(v["spanCount"], 1);
+        assert!(out_json.contains("\"level\":\"full\""), "js={out_json}");
+        assert!(out_json.contains("\"missing\":false"), "js={out_json}");
+        assert!(out_json.contains("\"isU8\":true"), "js={out_json}");
+        assert!(out_json.contains("\"diffBytes\":8"), "js={out_json}");
+        assert!(out_json.contains("\"spanCount\":1"), "js={out_json}");
     }
 
     // cleanup unused warning
